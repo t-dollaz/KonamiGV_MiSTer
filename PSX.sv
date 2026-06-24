@@ -337,7 +337,7 @@ always @(posedge clk_1x) begin : ffwd
 	fast_forward <= (FFrequest | ff_latch);
 end
 
-wire reset_or = RESET | buttons[1] | status[0] | bios_download | exe_download | cdDownloadReset;
+wire reset_or = RESET | buttons[1] | status[0] | bios_download | exe_download | cdDownloadReset | flash_download;
 
 ////////////////////////////  HPS I/O  //////////////////////////////////
 
@@ -352,7 +352,10 @@ parameter CONF_STR = {
 	"PSX;SS3E000000:400000;",
 	"H7S1,CUECHD,Load CD;",
 	"h7-,Reload core for CD;",
+	"S4,ISO,Mount 573 Disc;",
+	"S0,SAV,573 EEPROM Save;",
 	"F1,EXE,Load Exe;",
+	"F2,BIN,Load 573 Flash;",
 	"-;",
 	"d6C,Cheats;",
 	"h6O[6],Cheats Enabled,Yes,No;",
@@ -487,15 +490,17 @@ reg  [31:0] sd_lba0 = 0;
 reg  [31:0] sd_lba1;
 reg  [ 6:0] sd_lba2;
 reg  [ 6:0] sd_lba3;
-reg   [3:0] sd_rd;
-reg   [3:0] sd_wr;
-wire  [3:0] sd_ack;
+wire [31:0] sd_lba4;            // Konami 573 disc (slot 4), 1024-byte blocks
+reg   [4:0] sd_rd;
+reg   [4:0] sd_wr;
+wire  [4:0] sd_ack;
 wire  [8:0] sd_buff_addr;
 wire [15:0] sd_buff_dout;
 wire [15:0] sd_buff_din2;
 wire [15:0] sd_buff_din3;
+wire [15:0] eeprom_dataOut;     // Konami 573 EEPROM save read-out (slot 0)
 wire        sd_buff_wr;
-wire  [3:0] img_mounted;
+wire  [4:0] img_mounted;
 wire        img_readonly;
 wire [63:0] img_size;
 wire        ioctl_download;
@@ -544,7 +549,7 @@ wire [127:0] status_in = {status[127:39],ss_slot,status[36:19], 2'b00, status[16
 wire bk_pending;
 wire DIRECT_VIDEO;
 
-hps_io #(.CONF_STR(CONF_STR), .WIDE(1), .VDNUM(4), .BLKSZ(3)) hps_io
+hps_io #(.CONF_STR(CONF_STR), .WIDE(1), .VDNUM(5), .BLKSZ(3)) hps_io
 (
 	.clk_sys(clk_1x),
 	.HPS_BUS(HPS_BUS),
@@ -573,14 +578,14 @@ hps_io #(.CONF_STR(CONF_STR), .WIDE(1), .VDNUM(4), .BLKSZ(3)) hps_io
 	.ioctl_index(ioctl_index),
 	.ioctl_wait(ioctl_wait),
 
-	.sd_lba('{sd_lba0, sd_lba1, sd_lba2, sd_lba3}),
-	.sd_blk_cnt('{0,0, 0, 0}),
+	.sd_lba('{sd_lba0, sd_lba1, sd_lba2, sd_lba3, sd_lba4}),
+	.sd_blk_cnt('{0, 0, 0, 0, 0}),
 	.sd_rd(sd_rd),
 	.sd_wr(sd_wr),
 	.sd_ack(sd_ack),
 	.sd_buff_addr(sd_buff_addr),
 	.sd_buff_dout(sd_buff_dout),
-	.sd_buff_din('{0, 0, sd_buff_din2, sd_buff_din3}),
+	.sd_buff_din('{eeprom_dataOut, 0, sd_buff_din2, sd_buff_din3, 0}),
 	.sd_buff_wr(sd_buff_wr),
 
 	.TIMESTAMP(RTC_time),
@@ -611,10 +616,11 @@ hps_io #(.CONF_STR(CONF_STR), .WIDE(1), .VDNUM(4), .BLKSZ(3)) hps_io
 
 assign joy = joy_unmod[16] ? 20'b0 : joy_unmod;
 
-assign sd_rd[0] = 0;
-assign sd_wr[0] = 0;
+// slot 0 (sd_rd[0]/sd_wr[0]) is driven by the 573 EEPROM save mount (psx instance ports)
 
 assign sd_wr[1] = 0;
+
+assign sd_wr[4] = 0;   // Konami 573 disc is read-only
 
 wire [35:0] EXT_BUS;
 wire        heartbeat;
@@ -629,13 +635,20 @@ hps_ext hps_ext
 
 //////////////////////////  ROM DETECT  /////////////////////////////////
 
-reg bios_download, exe_download, cdinfo_download, code_download;
+reg bios_download, exe_download, cdinfo_download, code_download, flash_download;
 always @(posedge clk_1x) begin
 	bios_download    <= ioctl_download & (ioctl_index[5:0] == 0);
 	exe_download     <= ioctl_download & (ioctl_index == 1);
+	flash_download   <= ioctl_download & (ioctl_index == 2);   // Konami 573 flash -> DDR3
 	cdinfo_download  <= ioctl_download & (ioctl_index == 251);
 	code_download    <= ioctl_download & (ioctl_index == 255);
 end
+
+// Konami 573 flash download: stream 16-bit words into DDR3 via psx_mister (req/done, paced by ioctl_wait)
+reg        flash_dl_req = 0;
+reg [23:0] flash_dl_addr;
+reg [15:0] flash_dl_data;
+wire       flash_dl_done;
 
 reg cart_loaded = 0;
 always @(posedge clk_1x) begin
@@ -659,6 +672,9 @@ reg loadExe = 0;
 
 reg sd_mounted2 = 0;
 reg sd_mounted3 = 0;
+reg disc_mounted = 0;
+reg sd_mounted0 = 0;       // 573 EEPROM save mount (slot 0)
+reg eeprom_load = 0;
 
 reg memcard1_load = 0;
 reg memcard2_load = 0;
@@ -709,6 +725,17 @@ always @(posedge clk_1x) begin
          end
       end
       if(sdramCh3_done) ioctl_wait <= 0;
+   end else if (flash_download) begin
+      if (ioctl_wr) begin
+         flash_dl_addr <= ioctl_addr[23:0];   // byte offset within the 8MB flash region
+         flash_dl_data <= ioctl_dout;
+         flash_dl_req  <= 1;
+         ioctl_wait    <= 1;
+      end
+      if (flash_dl_done) begin
+         flash_dl_req  <= 0;
+         ioctl_wait    <= 0;
+      end
    end else begin
       ioctl_wait <= 0;
 	end
@@ -758,6 +785,17 @@ always @(posedge clk_1x) begin
    memcard1_load <= 0;
    memcard2_load <= 0;
    memcard_save <= 0;
+   eeprom_load <= 0;
+
+   // 573 EEPROM save mount (slot 0): load the 128B image on mount
+   if (img_mounted[0]) begin
+      if (img_size > 0) begin
+         sd_mounted0 <= 1;
+         eeprom_load <= 1;
+      end else begin
+         sd_mounted0 <= 0;
+      end
+   end
 
    // memcard 1
    if (img_mounted[2]) begin
@@ -797,6 +835,11 @@ always @(posedge clk_1x) begin
       end else begin
          memcard2_cnt <= memcard2_cnt + 1'd1;
       end
+   end
+
+   // Konami 573 disc mount (slot 4)
+   if (img_mounted[4]) begin
+      disc_mounted <= (img_size > 0);
    end
 
 	old_save   <= bk_save;
@@ -1157,6 +1200,30 @@ psx
    .cd_hps_ack      (sd_ack[1]),
    .cd_hps_write    (sd_buff_wr),
    .cd_hps_data     (sd_buff_dout),
+   // Konami 573 disc (sd_* slot 4)
+   .disc_req        (sd_rd[4]),
+   .disc_lba        (sd_lba4),
+   .disc_ack        (sd_ack[4]),
+   .disc_wr         (sd_buff_wr),
+   .disc_addr       (sd_buff_addr[8:0]),
+   .disc_data       (sd_buff_dout),
+   .disc_mounted    (disc_mounted),
+   // Konami 573 flash download (ioctl index 2 -> DDR3)
+   .flash_dl_req    (flash_dl_req),
+   .flash_dl_addr   (flash_dl_addr),
+   .flash_dl_data   (flash_dl_data),
+   .flash_dl_done   (flash_dl_done),
+   // Konami 573 EEPROM save mount (slot 0); save shares the memcard OSD/autosave trigger
+   .eeprom_load     (eeprom_load),
+   .eeprom_save     (memcard_save),
+   .eeprom_mounted  (sd_mounted0),
+   .eeprom_rd       (sd_rd[0]),
+   .eeprom_wr       (sd_wr[0]),
+   .eeprom_ack      (sd_ack[0]),
+   .eeprom_write    (sd_buff_wr),
+   .eeprom_addr     (sd_buff_addr[8:0]),
+   .eeprom_dataIn   (sd_buff_dout),
+   .eeprom_dataOut  (eeprom_dataOut),
    // spuram
    .spuram_dataWrite(spuram_dataWrite),
    .spuram_Adr      (spuram_Adr      ),

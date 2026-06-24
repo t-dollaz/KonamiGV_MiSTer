@@ -55,10 +55,10 @@ entity memorymux is
       bios_memctrl         : in  unsigned(13 downto 0);
       
       ex1_memctrl          : in  unsigned(13 downto 0);
-      --bus_exp1_addr        : out unsigned(22 downto 0); 
-      --bus_exp1_dataWrite   : out std_logic_vector(7 downto 0);
+      bus_exp1_addr        : out unsigned(22 downto 0);
+      bus_exp1_dataWrite   : out std_logic_vector(7 downto 0);
       bus_exp1_read        : out std_logic;
-      --bus_exp1_write       : out std_logic;
+      bus_exp1_write       : out std_logic;
       bus_exp1_dataRead    : in  std_logic_vector(7 downto 0);
       
       bus_memc_addr        : out unsigned(5 downto 0); 
@@ -241,6 +241,7 @@ architecture arch of memorymux is
    signal dataFromBusses         : std_logic_vector(31 downto 0);
    signal rotate32               : std_logic;
    signal rotate16               : std_logic;
+   signal exp1_byte_lane         : unsigned(1 downto 0);   -- EXP1 byte lane = byteStep (+ offset low bits on reads); see 573 SCSI fix below
          
    -- EXE handling      
    signal loadExe_latched        : std_logic := '0';
@@ -269,7 +270,8 @@ architecture arch of memorymux is
    signal ext_dataWrite_buf      : std_logic_vector(31 downto 0);
    signal ext_writeMask_buf      : std_logic_vector(3 downto 0);
    
-   signal ext_bus_addr           : unsigned(12 downto 0) := (others => '0'); 
+   signal ext_bus_addr           : unsigned(12 downto 0) := (others => '0');
+   signal ext_bus_addr_ex1       : unsigned(22 downto 0) := (others => '0');
    
    signal ext_memctrl            : unsigned(13 downto 0);
    signal ext_memctrl_WDelay     : unsigned(3 downto 0);
@@ -952,8 +954,16 @@ begin
    bus_exp2_read      <= '1' when (ext_state = EXT_READ_NEXT and ext_select_ex2_saved = '1') else '0';
    bus_exp2_dataWrite <= ext_dataWrite(7 downto 0);
    
-   -- busses EXP1+3 are stubs that are working in general, but there is nothing connected to them, so unused parts are not implemented
-   bus_exp1_read     <= '1' when (ext_state = EXT_READ_NEXT and ext_select_ex1_saved = '1') else '0';
+   -- EXP1 drives the Konami 573 device: full 23-bit address + write path (was a read-only stub)
+   -- 573 SCSI byte-lane fix: WRITES seed ext_byteStep from the write-mask (so it is already the real byte lane),
+   -- but READS leave ext_byteStep counting up from 0 -- which discarded the access offset's bit 1. A byte read of
+   -- an odd register (e.g. IRQSTATE @ 0x0A = lane 2) then aliased to the even neighbour (STATUS @ 0x08) and skipped
+   -- IRQSTATE's clear-STATUS-0x80 side-effect, stalling the 573 BIOS. Add the offset low bits on reads only.
+   exp1_byte_lane     <= ext_byteStep + ext_bus_addr_ex1(1 downto 0) when (ext_state = EXT_READ_NEXT) else ext_byteStep;
+   bus_exp1_addr      <= ext_bus_addr_ex1(22 downto 2) & exp1_byte_lane;  -- word base + byte lane
+   bus_exp1_write     <= '1' when (ext_write_ena = '1' and ext_select_ex1_saved = '1') else '0';
+   bus_exp1_dataWrite <= ext_dataWrite(7 downto 0);
+   bus_exp1_read      <= '1' when (ext_state = EXT_READ_NEXT and ext_select_ex1_saved = '1') else '0';
    bus_exp3_read     <= '1' when (ext_state = EXT_READ_NEXT and ext_select_ex3_saved = '1') else '0';
    
    ext_done          <= '1' when (ext_state = EXT_READ and ext_finished = '1') else '0';
@@ -1056,6 +1066,7 @@ begin
                   ext_byteStep         <= (others => '0');
                   ext_data             <= (others => '0');
                   ext_bus_addr         <= addressData_buf(12 downto 0);
+                  ext_bus_addr_ex1     <= addressData_buf(22 downto 0);
                   
                   ext_select_spu_saved <= ext_select_spu;
                   ext_select_cd_saved  <= ext_select_cd;

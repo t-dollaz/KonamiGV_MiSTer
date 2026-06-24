@@ -81,7 +81,9 @@ entity cpu is
       cpu_export            : out cpu_export_type := ((others => (others => '0')), (others => '0'), (others => '0'), (others => '0'));
 -- synthesis translate_on
       
-      debug_firstGTE        : in  std_logic
+      debug_firstGTE        : in  std_logic;
+
+      cpu_pc_dbg            : out unsigned(31 downto 0) := (others => '0')   -- DEBUG: synthesizable PC (=pcOld1)
    );
 end entity;
 
@@ -463,7 +465,9 @@ architecture arch of cpu is
    signal regs                         : tRegs := (others => (others => '0'));
 -- synthesis translate_on
    
-begin 
+begin
+
+   cpu_pc_dbg <= pcOld1;   -- DEBUG: expose the program counter (synthesizable) for the konami573 probe
 
    -- IO
    mem_request       <= mem1_request or mem1_request_latched or mem4_request when (memoryMuxBusy = '0' or mem_done = '1') else '0';

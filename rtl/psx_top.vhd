@@ -119,6 +119,30 @@ entity psx_top is
       cd_hps_ack            : in  std_logic;
       cd_hps_write          : in  std_logic;
       cd_hps_data           : in  std_logic_vector(15 downto 0);
+      -- Konami 573 disc (sd_* slot 4): 1024-byte blocks
+      disc_req              : out std_logic := '0';
+      disc_lba              : out std_logic_vector(31 downto 0);
+      disc_ack              : in  std_logic;
+      disc_wr               : in  std_logic;
+      disc_addr             : in  std_logic_vector(8 downto 0);
+      disc_data             : in  std_logic_vector(15 downto 0);
+      disc_mounted          : in  std_logic;
+      -- Konami 573 flash download (ioctl -> DDR3); clk1x req/done handshake, paced by ioctl_wait
+      flash_dl_req          : in  std_logic;                       -- write request (held until done)
+      flash_dl_addr         : in  std_logic_vector(23 downto 0);   -- byte address within flash region
+      flash_dl_data         : in  std_logic_vector(15 downto 0);   -- 16-bit word to write
+      flash_dl_done         : out std_logic := '0';                -- write committed (one-cycle pulse)
+      -- Konami 573 EEPROM save mount (sd_* slot 0)
+      eeprom_load           : in  std_logic;
+      eeprom_save           : in  std_logic;
+      eeprom_mounted        : in  std_logic;
+      eeprom_rd             : out std_logic := '0';
+      eeprom_wr             : out std_logic := '0';
+      eeprom_ack            : in  std_logic;
+      eeprom_write          : in  std_logic;
+      eeprom_addr           : in  std_logic_vector(8 downto 0);
+      eeprom_dataIn         : in  std_logic_vector(15 downto 0);
+      eeprom_dataOut        : out std_logic_vector(15 downto 0);
       -- spuram
       spuram_dataWrite      : out std_logic_vector(31 downto 0);
       spuram_Adr            : out std_logic_vector(18 downto 0);
@@ -315,16 +339,50 @@ architecture arch of psx_top is
    signal memSPU_WE              : std_logic := '0';
    signal memSPU_RD              : std_logic := '0';
 
+   -- ===== Increment C: flash 8 MB DDR3 consumer (region "0001" => DDR3 byte base 0x1000000) =====
+   signal memFlash_request       : std_logic := '0';
+   signal memFlash_acknext       : std_logic := '0';
+   signal memFlash_ack           : std_logic := '0';
+   signal memFlash_BURSTCNT      : std_logic_vector(7 downto 0) := x"01";
+   signal memFlash_ADDR          : std_logic_vector(23 downto 0) := (others => '0');
+   signal memFlash_DIN           : std_logic_vector(63 downto 0) := (others => '0');
+   signal memFlash_BE            : std_logic_vector(7 downto 0) := (others => '0');
+   signal memFlash_WE            : std_logic := '0';
+   signal memFlash_RD            : std_logic := '0';
+
+   type tFlashState is (FL_IDLE, FL_REQ, FL_RDWAIT, FL_DLWAIT);
+   signal flashState             : tFlashState := FL_IDLE;
+   signal fl_isWrite             : std_logic := '0';
+   signal fl_lane                : unsigned(1 downto 0) := "00";
+   signal flash_fetch_q          : std_logic := '0';
+   -- konami573 <-> flash FSM (internal)
+   signal flash_word_addr        : std_logic_vector(23 downto 0);
+   signal flash_fetch            : std_logic;
+   signal flash_data             : std_logic_vector(15 downto 0) := (others => '0');
+   signal flash_data_ready       : std_logic := '0';
+
    -- Busses
    signal bios_memctrl           : unsigned(13 downto 0);
    
    signal ex1_memctrl            : unsigned(13 downto 0);
-   --signal bus_exp1_addr          : unsigned(22 downto 0); 
-   --signal bus_exp1_dataWrite     : std_logic_vector(31 downto 0);
+   signal bus_exp1_addr          : unsigned(22 downto 0);
+   signal bus_exp1_dataWrite     : std_logic_vector(7 downto 0);
    signal bus_exp1_read          : std_logic;
-   --signal bus_exp1_write         : std_logic;
+   signal bus_exp1_write         : std_logic;
    signal bus_exp1_dataRead      : std_logic_vector(7 downto 0);
-   
+   signal konami_irq10           : std_logic;
+   signal cpu_pc_dbg             : unsigned(31 downto 0);   -- DEBUG: synthesizable CPU PC for the konami573 probe
+   signal cpu_pc_dbg_r           : unsigned(31 downto 0);   -- pipeline stage (relieves the long cpu->konami573 route)
+   -- Konami 573 DMA channel-5 provider (idma <-> ikonami573)
+   signal DMA_EXP_read           : std_logic_vector(31 downto 0);
+   signal DMA_EXP_readEna        : std_logic;
+   signal exp_dmaRequest         : std_logic;
+   signal exp_dmaDataValid       : std_logic;
+   signal dma5_done              : std_logic;
+   -- Konami 573 player-1 inputs, mapped from pad 1 into the 573 active-high button encoding.
+   signal konami_btn_ah          : unsigned(31 downto 0);   -- active-high pressed mask
+   signal konami_buttons         : unsigned(31 downto 0);   -- active-low (konami573 re-inverts)
+
    signal bus_memc_addr          : unsigned(5 downto 0); 
    signal bus_memc_dataWrite     : std_logic_vector(31 downto 0);
    signal bus_memc_read          : std_logic;
@@ -726,10 +784,7 @@ begin
    begin
       if rising_edge(clk1x) then
       
-         bus_exp1_dataRead <= (others => '0');
-         if (bus_exp1_read = '1') then
-            bus_exp1_dataRead <= (others => '1');
-         end if;
+         -- EXP1 read data is driven by the konami573 module instance below
       
          bus_exp3_dataRead <= (others => '0');
          if (bus_exp3_read = '1') then
@@ -860,17 +915,19 @@ begin
          memHPScard1_ack     <= '0';
          memHPScard2_ack     <= '0';
          memSPU_ack          <= '0';
-      
+         memFlash_ack        <= '0';
+
          if (reset_intern = '1') then
             arbiter_active    <= '0';
             vram_pause        <= '0';
             ddr3state         <= ARBITERIDLE;
-            
+
             memDDR3card1_acknext  <= '0';
-            memDDR3card2_acknext  <= '0';            
+            memDDR3card2_acknext  <= '0';
             memHPScard1_acknext   <= '0';
             memHPScard2_acknext   <= '0';
             memSPU_acknext        <= '0';
+            memFlash_acknext      <= '0';
          else
          
             case (ddr3state) is
@@ -881,7 +938,8 @@ begin
                   memHPScard1_acknext   <= '0';
                   memHPScard2_acknext   <= '0';
                   memSPU_acknext        <= '0';
-                  if (memDDR3card1_request = '1' or memDDR3card2_request = '1' or memHPScard1_request = '1' or memHPScard2_request = '1' or memSPU_request = '1') then
+                  memFlash_acknext      <= '0';
+                  if (memDDR3card1_request = '1' or memDDR3card2_request = '1' or memHPScard1_request = '1' or memHPScard2_request = '1' or memSPU_request = '1' or memFlash_request = '1') then
                      vram_pause <= '1';
                      ddr3state  <= WAITGPUPAUSED;
                   end if;
@@ -925,11 +983,19 @@ begin
                      elsif (memSPU_request = '1') then
                         memSPU_acknext       <= '1';
                         arbiter_BURSTCNT     <= memSPU_BURSTCNT;
-                        arbiter_ADDR         <= x"03" & memSPU_ADDR;    
-                        arbiter_DIN          <= memSPU_DIN;     
-                        arbiter_BE           <= memSPU_BE;      
-                        arbiter_WE           <= memSPU_WE;      
+                        arbiter_ADDR         <= x"03" & memSPU_ADDR;
+                        arbiter_DIN          <= memSPU_DIN;
+                        arbiter_BE           <= memSPU_BE;
+                        arbiter_WE           <= memSPU_WE;
                         arbiter_RD           <= memSPU_RD;
+                     elsif (memFlash_request = '1') then
+                        memFlash_acknext     <= '1';
+                        arbiter_BURSTCNT     <= memFlash_BURSTCNT;
+                        arbiter_ADDR         <= "0001" & memFlash_ADDR;   -- DDR3 byte base 0x1000000 (16 MB)
+                        arbiter_DIN          <= memFlash_DIN;
+                        arbiter_BE           <= memFlash_BE;
+                        arbiter_WE           <= memFlash_WE;
+                        arbiter_RD           <= memFlash_RD;
                      end if;
                   end if;
                
@@ -943,15 +1009,17 @@ begin
                      if (memHPScard1_acknext  = '1') then memHPScard1_ack <= '1';  end if;
                      if (memHPScard2_acknext  = '1') then memHPScard2_ack <= '1';  end if;
                      if (memSPU_acknext       = '1') then memSPU_ack <= '1';       end if;
+                     if (memFlash_acknext     = '1') then memFlash_ack <= '1';     end if;
                   end if;
                
                when WAITDONE =>
                   if (
                       (memDDR3card1_request and memDDR3card1_acknext) = '0' and 
                       (memDDR3card2_request and memDDR3card2_acknext) = '0' and 
-                      (memHPScard1_request  and memHPScard1_acknext ) = '0' and 
+                      (memHPScard1_request  and memHPScard1_acknext ) = '0' and
                       (memHPScard2_request  and memHPScard2_acknext ) = '0' and
-                      (memSPU_request       and memSPU_acknext      ) = '0'
+                      (memSPU_request       and memSPU_acknext      ) = '0' and
+                      (memFlash_request     and memFlash_acknext    ) = '0'
                      ) then
                      ddr3state      <= ARBITERIDLE;
                      arbiter_active <= '0';
@@ -962,8 +1030,91 @@ begin
          end if;
       end if;
    end process;
-   
-   
+
+
+   -- ===== Increment C: flash 8 MB DDR3 reader/loader (clk2x = DDR3 domain) =====
+   -- Runtime: konami573 pulses flash_fetch (clk1x) with flash_word_addr -> read the 64-bit
+   --   DDR3 line, extract the 16-bit lane -> flash_data. Prefetch hides latency (no EXP1 stall).
+   -- Download: PSX.sv streams 16-bit words (flash_dl_req held, paced by ioctl_wait) -> BE write.
+   -- The arbiter's vram-pause serializes DDR3, so the next DOUT_READY after our ack is ours.
+   process (clk2x)
+   begin
+      if rising_edge(clk2x) then
+         flash_data_ready <= '0';   -- pulse (konami573 ignores it; prefetch hides latency)
+         flash_fetch_q    <= flash_fetch;
+
+         if (reset_intern = '1') then
+            flashState       <= FL_IDLE;
+            memFlash_request <= '0';
+            memFlash_RD      <= '0';
+            memFlash_WE      <= '0';
+            flash_dl_done    <= '0';
+         else
+            case flashState is
+
+               when FL_IDLE =>
+                  if (flash_dl_req = '1') then                          -- download write (priority)
+                     fl_isWrite       <= '1';
+                     memFlash_ADDR    <= flash_dl_addr;
+                     memFlash_DIN     <= flash_dl_data & flash_dl_data & flash_dl_data & flash_dl_data;
+                     case flash_dl_addr(2 downto 1) is                 -- 16-bit lane within 64-bit line
+                        when "00"   => memFlash_BE <= "00000011";
+                        when "01"   => memFlash_BE <= "00001100";
+                        when "10"   => memFlash_BE <= "00110000";
+                        when others => memFlash_BE <= "11000000";
+                     end case;
+                     memFlash_WE      <= '1';
+                     memFlash_RD      <= '0';
+                     memFlash_request <= '1';
+                     flashState       <= FL_REQ;
+                  elsif (flash_fetch = '1' and flash_fetch_q = '0') then -- runtime read (rising edge)
+                     fl_isWrite       <= '0';
+                     memFlash_ADDR    <= flash_word_addr(22 downto 0) & '0';  -- byte addr = word << 1
+                     fl_lane          <= unsigned(flash_word_addr(1 downto 0));
+                     memFlash_BE      <= (others => '1');
+                     memFlash_WE      <= '0';
+                     memFlash_RD      <= '1';
+                     memFlash_request <= '1';
+                     flashState       <= FL_REQ;
+                  end if;
+
+               when FL_REQ =>
+                  if (memFlash_ack = '1') then
+                     memFlash_request <= '0';
+                     memFlash_RD      <= '0';
+                     memFlash_WE      <= '0';
+                     if (fl_isWrite = '1') then
+                        flash_dl_done <= '1';        -- level: held until PSX.sv drops flash_dl_req
+                        flashState    <= FL_DLWAIT;
+                     else
+                        flashState    <= FL_RDWAIT;
+                     end if;
+                  end if;
+
+               when FL_DLWAIT =>
+                  if (flash_dl_req = '0') then        -- 4-phase handshake completes
+                     flash_dl_done <= '0';
+                     flashState    <= FL_IDLE;
+                  end if;
+
+               when FL_RDWAIT =>
+                  if (ddr3_DOUT_READY = '1') then
+                     case fl_lane is
+                        when "00"   => flash_data <= ddr3_DOUT(15 downto 0);
+                        when "01"   => flash_data <= ddr3_DOUT(31 downto 16);
+                        when "10"   => flash_data <= ddr3_DOUT(47 downto 32);
+                        when others => flash_data <= ddr3_DOUT(63 downto 48);
+                     end case;
+                     flash_data_ready <= '1';
+                     flashState       <= FL_IDLE;
+                  end if;
+
+            end case;
+         end if;
+      end if;
+   end process;
+
+
    imemctrl : entity work.memctrl
    port map
    (
@@ -1186,6 +1337,7 @@ begin
    
    irq_SIO       <= '0'; -- todo
    irq_LIGHTPEN  <= '1' when
+                    konami_irq10 = '1' or
                     (irq10Snac = '1' and snacport1 = '1') or
                     (irq10Snac = '1' and snacport2 = '1') or
                     (Gun1IRQ10 = '1' and joypad1.PadPortJustif = '1' and JustifierIrqEnable(0) = '1') or
@@ -1293,9 +1445,15 @@ begin
       cd_memctrl           => cd_memctrl,
       com0_delay           => com0_delay,
       DMA_CD_readEna       => DMA_CD_readEna,
-      DMA_CD_read          => DMA_CD_read,   
-      
-      spu_timing_on        => dma_spu_timing_on,   
+      DMA_CD_read          => DMA_CD_read,
+
+      exp_dmaRequest       => exp_dmaRequest,
+      DMA_EXP_readEna      => DMA_EXP_readEna,
+      DMA_EXP_read         => DMA_EXP_read,
+      exp_dmaDataValid     => exp_dmaDataValid,
+      dma5_done            => dma5_done,
+
+      spu_timing_on        => dma_spu_timing_on,
       spu_timing_value     => dma_spu_timing_value,
       spu_dmaRequest       => spu_dmaRequest, 
       DMA_SPU_writeEna     => DMA_SPU_writeEna,   
@@ -1712,6 +1870,77 @@ begin
       bus_dataRead         => bus_exp2_dataRead
    );
 
+   -- Map pad 1 to the Konami 573 P1 button encoding (active-high), then invert: konami573's
+   -- internal CurrentButtons = buttons xor 0xFFFFFFFF (matches konami.cpp KonamiButtonsSet).
+   --   0x0010 UP / 0x0020 RIGHT / 0x0040 DOWN / 0x0080 LEFT / 0x2000|0x4000 BUTTON1 / 0x0008 START
+   konami_btn_ah <= (  4 => joypad1.KeyUp,
+                       5 => joypad1.KeyRight,
+                       6 => joypad1.KeyDown,
+                       7 => joypad1.KeyLeft,
+                      13 => joypad1.KeyCircle,
+                      14 => joypad1.KeyCross,
+                       3 => joypad1.KeyStart,
+                      others => '0');
+   konami_buttons <= not konami_btn_ah;
+
+   -- DEBUG: pipeline the CPU PC one cycle before the long route into konami573
+   process (clk1x) begin
+      if rising_edge(clk1x) then cpu_pc_dbg_r <= cpu_pc_dbg; end if;
+   end process;
+
+   ikonami573 : entity work.konami573
+   port map
+   (
+      clk1x                => clk1x,
+      ce                   => ce,
+      reset                => reset_intern,
+
+      bus_addr             => bus_exp1_addr,
+      bus_dataWrite        => bus_exp1_dataWrite,
+      bus_read             => bus_exp1_read,
+      bus_write            => bus_exp1_write,
+      bus_dataRead         => bus_exp1_dataRead,
+
+      irq10_set            => konami_irq10,
+
+      DMA_EXP_read         => DMA_EXP_read,
+      DMA_EXP_readEna      => DMA_EXP_readEna,
+      exp_dmaRequest       => exp_dmaRequest,
+      exp_dmaDataValid     => exp_dmaDataValid,
+      dma5_done            => dma5_done,
+
+      disc_req             => disc_req,
+      disc_lba             => disc_lba,
+      disc_ack             => disc_ack,
+      disc_wr              => disc_wr,
+      disc_addr            => disc_addr,
+      disc_data            => disc_data,
+      disc_mounted         => disc_mounted,
+
+      flash_word_addr      => flash_word_addr,
+      flash_fetch          => flash_fetch,
+      flash_data           => flash_data,
+      flash_data_ready     => flash_data_ready,
+
+      eeprom_load          => eeprom_load,
+      eeprom_save          => eeprom_save,
+      eeprom_mounted       => eeprom_mounted,
+      eeprom_rd            => eeprom_rd,
+      eeprom_wr            => eeprom_wr,
+      eeprom_ack           => eeprom_ack,
+      eeprom_write         => eeprom_write,
+      eeprom_addr          => eeprom_addr,
+      eeprom_dataIn        => eeprom_dataIn,
+      eeprom_dataOut       => eeprom_dataOut,
+
+      buttons              => konami_buttons,
+      mouse_event          => MouseEvent,
+      mouse_x              => MouseX,
+      mouse_y              => MouseY,
+
+      cpu_pc               => cpu_pc_dbg_r   -- DEBUG: CPU program counter readout (pipelined, synthesizable)
+   );
+
    imemorymux : entity work.memorymux
    port map
    (
@@ -1763,10 +1992,10 @@ begin
       bios_memctrl         => bios_memctrl,
 
       ex1_memctrl          => ex1_memctrl,
-      --bus_exp1_addr        => bus_exp1_addr,   
-      --bus_exp1_dataWrite   => bus_exp1_dataWrite,
-      bus_exp1_read        => bus_exp1_read,   
-      --bus_exp1_write       => bus_exp1_write,  
+      bus_exp1_addr        => bus_exp1_addr,
+      bus_exp1_dataWrite   => bus_exp1_dataWrite,
+      bus_exp1_read        => bus_exp1_read,
+      bus_exp1_write       => bus_exp1_write,
       bus_exp1_dataRead    => bus_exp1_dataRead,
       
       bus_memc_addr        => bus_memc_addr,     
@@ -1941,9 +2170,10 @@ begin
       cpu_export        => cpu_export,
 -- synthesis translate_on
       
-      debug_firstGTE    => debug_firstGTE
+      debug_firstGTE    => debug_firstGTE,
+      cpu_pc_dbg        => cpu_pc_dbg
    );
-   
+
    igte : entity work.gte
    port map
    (

@@ -115,6 +115,30 @@ entity psx_mister is
       cd_hps_ack            : in  std_logic;
       cd_hps_write          : in  std_logic;
       cd_hps_data           : in  std_logic_vector(15 downto 0);
+      -- Konami 573 disc (sd_* slot 4)
+      disc_req              : out std_logic := '0';
+      disc_lba              : out std_logic_vector(31 downto 0);
+      disc_ack              : in  std_logic;
+      disc_wr               : in  std_logic;
+      disc_addr             : in  std_logic_vector(8 downto 0);
+      disc_data             : in  std_logic_vector(15 downto 0);
+      disc_mounted          : in  std_logic;
+      -- Konami 573 flash download (ioctl -> DDR3)
+      flash_dl_req          : in  std_logic;
+      flash_dl_addr         : in  std_logic_vector(23 downto 0);
+      flash_dl_data         : in  std_logic_vector(15 downto 0);
+      flash_dl_done         : out std_logic := '0';
+      -- Konami 573 EEPROM save mount (sd_* slot 0)
+      eeprom_load           : in  std_logic;
+      eeprom_save           : in  std_logic;
+      eeprom_mounted        : in  std_logic;
+      eeprom_rd             : out std_logic := '0';
+      eeprom_wr             : out std_logic := '0';
+      eeprom_ack            : in  std_logic;
+      eeprom_write          : in  std_logic;
+      eeprom_addr           : in  std_logic_vector(8 downto 0);
+      eeprom_dataIn         : in  std_logic_vector(15 downto 0);
+      eeprom_dataOut        : out std_logic_vector(15 downto 0);
       -- spuram
       spuram_dataWrite      : out std_logic_vector(31 downto 0);
       spuram_Adr            : out std_logic_vector(18 downto 0);
@@ -407,7 +431,28 @@ begin
       cd_hps_lba_sim        => cd_hps_lba_sim,  
       cd_hps_ack            => cd_hps_ack,
       cd_hps_write          => cd_hps_write,
-      cd_hps_data           => cd_hps_data, 
+      cd_hps_data           => cd_hps_data,
+      disc_req              => disc_req,
+      disc_lba              => disc_lba,
+      disc_ack              => disc_ack,
+      disc_wr               => disc_wr,
+      disc_addr             => disc_addr,
+      disc_data             => disc_data,
+      disc_mounted          => disc_mounted,
+      flash_dl_req          => flash_dl_req,
+      flash_dl_addr         => flash_dl_addr,
+      flash_dl_data         => flash_dl_data,
+      flash_dl_done         => flash_dl_done,
+      eeprom_load           => eeprom_load,
+      eeprom_save           => eeprom_save,
+      eeprom_mounted        => eeprom_mounted,
+      eeprom_rd             => eeprom_rd,
+      eeprom_wr             => eeprom_wr,
+      eeprom_ack            => eeprom_ack,
+      eeprom_write          => eeprom_write,
+      eeprom_addr           => eeprom_addr,
+      eeprom_dataIn         => eeprom_dataIn,
+      eeprom_dataOut        => eeprom_dataOut,
       -- spuram
       spuram_dataWrite      => spuram_dataWrite, 
       spuram_Adr            => spuram_Adr,       

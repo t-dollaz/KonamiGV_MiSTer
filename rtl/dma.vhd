@@ -64,6 +64,12 @@ entity dma is
       com0_delay           : in  unsigned(3 downto 0);
       DMA_CD_readEna       : out std_logic := '0';
       DMA_CD_read          : in  std_logic_vector(7 downto 0);
+
+      exp_dmaRequest       : in  std_logic;
+      DMA_EXP_readEna      : out std_logic := '0';
+      DMA_EXP_read         : in  std_logic_vector(31 downto 0);
+      exp_dmaDataValid     : in  std_logic;
+      dma5_done            : out std_logic := '0';   -- 1-cycle pulse when ch5 transfer completes
       
       spu_timing_on        : in  std_logic;
       spu_timing_value     : in  unsigned(3 downto 0);
@@ -222,8 +228,9 @@ begin
    DMA_CD_readEna    <= '1' when (dmaState = WORKING and fifoOut_NearFull = '0' and activeChannel = 3 and toDevice = '0') else '0';
    
    DMA_SPU_readEna   <= '1' when (dmaState = WORKING and fifoOut_NearFull = '0' and activeChannel = 4 and toDevice = '0') else '0';
+   DMA_EXP_readEna   <= '1' when (dmaState = WORKING and fifoOut_NearFull = '0' and activeChannel = 5 and toDevice = '0') else '0';
 
-   readStall <= '1' when (activeChannel = 2 and toDevice = '0' and gpu_dmaRequest = '0') else '0';
+   readStall <= '1' when (activeChannel = 2 and toDevice = '0' and gpu_dmaRequest = '0') or (activeChannel = 5 and toDevice = '0' and exp_dmaDataValid = '0') else '0';
 
    chopsize     <= to_unsigned(1, 8) sll to_integer(dmaSettings.D_CHCR(18 downto 16));
    chopwaittime <= to_unsigned(1, 8) sll to_integer(dmaSettings.D_CHCR(22 downto 20));
@@ -342,7 +349,8 @@ begin
          
             irqOut               <= '0';
             ram_ena              <= '0';
-            
+            dma5_done            <= '0';
+
             DMA_MDEC_writeEna    <= '0';
             DMA_GPU_writeEna     <= '0';
             DMA_SPU_writeEna     <= '0';           
@@ -360,7 +368,7 @@ begin
             dmaArray(2).request <= gpu_dmaRequest;
             dmaArray(3).request <= '1';
             dmaArray(4).request <= spu_dmaRequest;
-            dmaArray(5).request <= '0';
+            dmaArray(5).request <= exp_dmaRequest;
             dmaArray(6).request <= '1';
             
             -- triggers from modules
@@ -370,6 +378,7 @@ begin
             if (dmaArray(2).D_CHCR(28) = '1' or gpu_dmaRequest = '1')        then triggerDMA(2) <= '1'; end if;
             if (dmaArray(3).D_CHCR(28) = '1')                                then triggerDMA(3) <= '1'; end if;
             if (dmaArray(4).D_CHCR(28) = '1' or spu_dmaRequest = '1')        then triggerDMA(4) <= '1'; end if;
+            if (dmaArray(5).D_CHCR(28) = '1' or exp_dmaRequest = '1')        then triggerDMA(5) <= '1'; end if;
             if (dmaArray(6).D_CHCR(28) = '1')                                then triggerDMA(6) <= '1'; end if;
             
             -- bus read
@@ -734,7 +743,14 @@ begin
                               end if;
                            end if;
                      
-                        when others => report "DMA channel not implemented" severity failure; 
+                        when 5 =>
+                           if (toDevice = '0') then
+                              fifoOut_Wr                <= not dmaSettings.D_MADR(23);
+                              fifoOut_Din(52 downto 32) <= std_logic_vector(dmaSettings.D_MADR(22 downto 2));
+                              fifoOut_Din(31 downto 0)  <= DMA_EXP_read;
+                           end if;
+
+                        when others => report "DMA channel not implemented" severity failure;
                      end case;
                      
                      if (ram8mb = '0') then
@@ -883,6 +899,10 @@ begin
                         dmaArray(activeChannel).D_BCR  <= dmaSettings.D_BCR;
                         dmaArray(activeChannel).D_CHCR(24) <= '0';
                         dmaArray(activeChannel).channelOn  <= '0';
+                        -- ch5 (Konami 573 disc): signal completion after the fifo has drained to RAM
+                        if (activeChannel = 5) then
+                           dma5_done <= '1';
+                        end if;
                      end if;
                   end if;
                
