@@ -54,6 +54,8 @@ entity konami573 is
       flash_fetch      : out std_logic := '0';      -- pulse when FlashAddress changes -> prefetch
       flash_data       : in  std_logic_vector(15 downto 0); -- interleaved 16-bit word at FlashAddress
       flash_data_ready : in  std_logic;             -- word valid (unused: prefetch hides latency)
+      flash_rdaddr     : in  std_logic_vector(23 downto 0) := (others => '1'); -- FA that flash_data is valid for (fix A)
+      bus_exp1_wait    : out std_logic := '0';      -- fix A: stall the EXP1 read until flash_data is valid
 
       -- EEPROM persistence (Increment D-eeprom): memcard-style HPS save mount on sd_* slot 0.
       -- 128 B = 64 16-bit words in the first part of one 1024-byte block. Load on mount, save on dirty.
@@ -224,6 +226,14 @@ begin
 
    -- Flash word index presented continuously to the psx_top DDR3 fetch FSM.
    flash_word_addr <= std_logic_vector(FlashAddress);
+
+   -- Fix A: the old prefetch assumed the slow EXP1 bus hid the DDR3 latency -- false (tb_flash),
+   -- so the loader's tight read loop got STALE flash data. Now a flash-data-port read STALLS
+   -- (bus_exp1_wait) until the DDR3 FSM publishes the word for THIS FlashAddress (flash_rdaddr ==
+   -- FlashAddress). Level-based compare = clk1x/clk2x-CDC-safe (no fragile ready pulse).
+   bus_exp1_wait <= '1' when (bus_read = '1' and region = 16#68# and
+                              bus_addr(7 downto 4) = "1000" and bus_addr(3 downto 1) = "000" and
+                              flash_rdaddr /= std_logic_vector(FlashAddress)) else '0';
 
    -- EEPROM save-mount FSM: load the 128 B dump on mount, write it back when dirty. The sd_*
    -- rd/wr handshake mirrors memcard.vhd (assert until ack; the buffer streams during the ack
@@ -397,15 +407,18 @@ begin
                         if bus_addr(3 downto 1) = "000" then        -- offset 0: 16-bit interleaved word
                            if bus_addr(0) = '0' then
                               bus_dataRead <= flash_data(7 downto 0);    -- low byte  (Flash[Chip])
+                              -- fix A: kick a DDR3 fetch of the CURRENT word; bus_exp1_wait holds the
+                              -- read until flash_rdaddr == FlashAddress (no more racey prefetch).
+                              if flash_rdaddr /= std_logic_vector(FlashAddress) then
+                                 flash_fetch <= '1';
+                              end if;
                            else
                               bus_dataRead <= flash_data(15 downto 8);   -- high byte (Flash[Chip+1])
                               FlashAddress <= FlashAddress + 1;          -- FA++ after the high byte
-                              flash_fetch  <= '1';                       -- prefetch next word
                            end if;
                         elsif bus_addr(3 downto 1) = "100" then     -- offset 8: FA |= 1
                            bus_dataRead <= (others => '0');
                            FlashAddress <= FlashAddress or to_unsigned(1, FlashAddress'length);
-                           flash_fetch  <= '1';
                         else
                            bus_dataRead <= (others => '0');
                         end if;
@@ -504,13 +517,10 @@ begin
                      if bus_addr(7 downto 4) = "1000" then         -- flash window only (not trackball 0xC0+)
                         case to_integer(bus_addr(3 downto 0)) is
                            when 2 => FlashAddress <= shift_left(resize(unsigned(bus_dataWrite), 24), 1);
-                                     flash_fetch  <= '1';
                            when 4 => FlashAddress <= (FlashAddress and to_unsigned(16#FF00FF#, 24)) or
                                                      shift_left(resize(unsigned(bus_dataWrite), 24), 8);
-                                     flash_fetch  <= '1';
                            when 6 => FlashAddress <= (FlashAddress and to_unsigned(16#00FFFF#, 24)) or
                                                      shift_left(resize(unsigned(bus_dataWrite), 24), 15);
-                                     flash_fetch  <= '1';
                            when others => null;
                         end case;
                      end if;

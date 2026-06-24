@@ -360,6 +360,8 @@ architecture arch of psx_top is
    signal flash_fetch            : std_logic;
    signal flash_data             : std_logic_vector(15 downto 0) := (others => '0');
    signal flash_data_ready       : std_logic := '0';
+   signal flash_rdaddr           : std_logic_vector(23 downto 0) := (others => '1');  -- fix A: FA that flash_data is valid for
+   signal bus_exp1_wait_s        : std_logic;                                          -- fix A: konami573 -> memorymux EXP1 stall
 
    -- Busses
    signal bios_memctrl           : unsigned(13 downto 0);
@@ -1049,6 +1051,7 @@ begin
             memFlash_RD      <= '0';
             memFlash_WE      <= '0';
             flash_dl_done    <= '0';
+            flash_rdaddr     <= (others => '1');   -- fix A: no FA valid yet (forces first read to fetch)
          else
             case flashState is
 
@@ -1105,6 +1108,7 @@ begin
                         when "10"   => flash_data <= ddr3_DOUT(47 downto 32);
                         when others => flash_data <= ddr3_DOUT(63 downto 48);
                      end case;
+                     flash_rdaddr     <= '0' & memFlash_ADDR(23 downto 1);  -- fix A: publish the FA now valid in flash_data
                      flash_data_ready <= '1';
                      flashState       <= FL_IDLE;
                   end if;
@@ -1921,6 +1925,8 @@ begin
       flash_fetch          => flash_fetch,
       flash_data           => flash_data,
       flash_data_ready     => flash_data_ready,
+      flash_rdaddr         => flash_rdaddr,
+      bus_exp1_wait        => bus_exp1_wait_s,
 
       eeprom_load          => eeprom_load,
       eeprom_save          => eeprom_save,
@@ -1997,6 +2003,7 @@ begin
       bus_exp1_read        => bus_exp1_read,
       bus_exp1_write       => bus_exp1_write,
       bus_exp1_dataRead    => bus_exp1_dataRead,
+      bus_exp1_wait        => bus_exp1_wait_s,
       
       bus_memc_addr        => bus_memc_addr,     
       bus_memc_dataWrite   => bus_memc_dataWrite,

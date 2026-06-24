@@ -60,6 +60,7 @@ entity memorymux is
       bus_exp1_read        : out std_logic;
       bus_exp1_write       : out std_logic;
       bus_exp1_dataRead    : in  std_logic_vector(7 downto 0);
+      bus_exp1_wait        : in  std_logic := '0';   -- fix A: EXP1 device stall (flash DDR3 not ready)
       
       bus_memc_addr        : out unsigned(5 downto 0); 
       bus_memc_dataWrite   : out std_logic_vector(31 downto 0);
@@ -1198,8 +1199,12 @@ begin
                   
                -- read
                when EXT_READ_NEXT =>
-                  ext_state <= EXT_READ;
-                  
+                  if (ext_select_ex1_saved = '1' and bus_exp1_wait = '1') then
+                     ext_state <= EXT_READ_NEXT;   -- fix A: hold here (bus_exp1_read stays asserted) until the EXP1 flash device is ready
+                  else
+                     ext_state <= EXT_READ;
+                  end if;
+
                   if (ext_memctrl_width = '0' and ext_byteStep = "11") then
                      ext_finished       <= '1';
                   elsif (ext_memctrl_width = '0' and ext_byteStep = "01" and reqsize_buf = "01") then
