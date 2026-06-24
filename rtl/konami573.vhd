@@ -160,6 +160,7 @@ architecture arch of konami573 is
    signal dbg_pc_cnt   : unsigned(DBG_PC_CNT_BITS-1 downto 0) := (others => '0');
    signal dbg_pc_phase : unsigned(1 downto 0) := (others => '0');
    signal dbg_pc_latch : unsigned(31 downto 0) := (others => '0');  -- PC snapshot (frozen at phase 0)
+   signal scsi_seen    : std_logic := '0';  -- latched once the boot first touches SCSI (region 0) -> silences the PC probe
 
 begin
 
@@ -332,6 +333,7 @@ begin
             disc_req     <= '0';
             dbg_pc_cnt   <= (others => '0');
             dbg_pc_phase <= (others => '0');
+            scsi_seen    <= '0';
             TrackballX   <= (others => '0');
             TrackballY   <= (others => '0');
 
@@ -341,10 +343,16 @@ begin
             -- DEBUG PROBE: emit the CPU program counter over the disc-read channel.
             -- Free-running counter; on wrap, fire one disc read whose LBA encodes a
             -- slice of cpu_pc (3 phases). Gated to D_IDLE + no pending real read, so
-            -- it never disturbs an actual disc transfer.
+            -- it never disturbs an actual disc transfer. ALSO gated on scsi_seen='0':
+            -- once the boot reaches the SCSI registers (region 0) it is past the early
+            -- flash loop, so the probe goes silent and cannot collide with the boot's
+            -- real disc reads. Probe stays live only while stuck BEFORE SCSI (diagnostic).
             ------------------------------------------------------------------
+            if ((bus_read = '1' or bus_write = '1') and region = 16#00#) then
+               scsi_seen <= '1';
+            end if;
             dbg_pc_cnt <= dbg_pc_cnt + 1;
-            if (dbg_pc_cnt = 0 and discState = D_IDLE and dmaArmed = '0' and fetchStart = '0') then
+            if (scsi_seen = '0' and dbg_pc_cnt = 0 and discState = D_IDLE and dmaArmed = '0' and fetchStart = '0') then
                -- SNAPSHOT: freeze the whole PC at phase 0, then emit all 3 slices from the latch,
                -- so the 3 disc reads describe ONE PC (the v1 bug sampled 3 different-time PCs).
                case dbg_pc_phase is
