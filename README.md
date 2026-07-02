@@ -1,5 +1,7 @@
 # Konami GV ("Baby Phoenix") — MiSTer FPGA core
 
+## This is an experimental core and is not endorsed or tested by the MiSTer community at large. My only goal was to get Simpsons Bowling working. This may not be wired correctly for full GV support.
+
 A MiSTer core for Konami's GV arcade system, built from the
 [PSX_MiSTer](https://github.com/MiSTer-devel/PSX_MiSTer) core by Robert Peip
 (FPGAzumSpass). The GV is a PlayStation-based arcade board: retail PSX silicon
