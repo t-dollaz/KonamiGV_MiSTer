@@ -81,8 +81,8 @@ both timing corners met on the shipping build).
 | 4×2 MB flash from DDR3 | ✅ tested on hw | read-wait design; 16-bit address-register writes reassembled |
 | EEPROM window + save mount | ✅ tested on hw | auto-load on mount, dirty write-back, security check passes |
 | EXP1 sub-word semantics | ✅ tested on hw | byte/16/32-bit lanes match konami.cpp exactly; MEMCTRL bus-width reconfig ignored (as the reference does) |
-| JAMMA inputs (pad→P1 map) | ✅ tested on hw | start/buttons play; Select = COIN1, R2 = SERVICE1 (per `konamigv.cpp` INPUT_PORTS) |
-| Trackball | ✅ tested on hw | mouse-driven; per-packet edge fix, OSD speed divider (1x…1/8) + OSD invert (X/Y/X+Y) |
+| JAMMA inputs (pad→P1 map) | ✅ tested on hw | Buttons in use: Start must be pressed to begin the game. After pressing start, PSX pad input "X" is used for action button. Select = COIN1, R2 = SERVICE1 (per `konamigv.cpp` INPUT_PORTS) |
+| Trackball | ✅ tested on hw, NOT with any kind of trackball, just a USB mouse | mouse-driven; per-packet edge fix, OSD speed divider (1x…1/8) + OSD invert (X/Y/X+Y) |
 | Service Mode (TEST switch) | ⚠️ delivery works, menu blocked | OSD toggle reaches the game (P1 bit 12), but test-mode entry dies at the flash write check — **see the EEPROM warning above**; fix designed in `docs/FLASH_WRITE_DESIGN.md` |
 | Flash writes (29F016A program/erase) | 🏗️ in progress | read path is done/tested; write path per MAME `intelfsh` is the current work item |
 | On-chip telemetry | ✅ kept aboard | access-ring/IRQ counters emitted via disc-fd marker channel |
