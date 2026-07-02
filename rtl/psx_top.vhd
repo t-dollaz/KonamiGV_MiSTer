@@ -355,7 +355,7 @@ architecture arch of psx_top is
    signal memFlash_RD            : std_logic := '0';
 
    type tFlashState is (FL_IDLE, FL_REQ, FL_RDWAIT, FL_DLWAIT,
-                        FL_OPREAD, FL_OPRDWAIT, FL_OPMOD, FL_OPWRITE, FL_FILL, FL_FILLNEXT, FL_OPACK);
+                        FL_OPREAD, FL_OPMOD, FL_OPWRITE, FL_FILL, FL_FILLNEXT, FL_OPACK);
    signal flashState             : tFlashState := FL_IDLE;
 
    -- 29F016A write ops from konami573 (docs/FLASH_WRITE_DESIGN.md): program = line RMW with

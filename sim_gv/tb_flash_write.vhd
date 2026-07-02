@@ -78,7 +78,7 @@ architecture sim of tb_flash_write is
    signal memFlash_WE      : std_logic := '0';
    signal memFlash_RD      : std_logic := '0';
    type tFlashState is (FL_IDLE, FL_REQ, FL_RDWAIT, FL_DLWAIT,
-                        FL_OPREAD, FL_OPRDWAIT, FL_OPMOD, FL_OPWRITE, FL_FILL, FL_FILLNEXT, FL_OPACK);
+                        FL_OPREAD, FL_OPMOD, FL_OPWRITE, FL_FILL, FL_FILLNEXT, FL_OPACK);
    signal flashState       : tFlashState := FL_IDLE;
    signal fl_isWrite       : std_logic := '0';
    signal fl_lane          : unsigned(1 downto 0) := "00";
@@ -298,9 +298,6 @@ begin
                      fl_op_line       <= ddr3_DOUT;
                      flashState       <= FL_OPMOD;
                   end if;
-
-               when FL_OPRDWAIT =>
-                  flashState <= FL_IDLE;   -- unused (kept to mirror psx_top state list)
 
                when FL_OPMOD =>
                   for i in 0 to 7 loop
