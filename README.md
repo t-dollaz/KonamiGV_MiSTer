@@ -13,6 +13,31 @@ which boots, passes its security check, and plays on real hardware.
 > 93C46-class EEPROM. The authoritative hardware reference is MAME's
 > `konamigv.cpp`, not `ksys573.cpp`.
 
+## ⚠️ Do NOT use the Service Mode toggle without backing up your EEPROM first
+
+The OSD has a `Service Mode` switch (the cabinet's TEST button). **Before
+ever turning it on, copy your known-good `simpbowl.sav` somewhere safe.**
+
+Why: when Simpsons Bowling sees TEST asserted, its test-mode entry runs a
+**destructive EEPROM self-test** — it overwrites the entire EEPROM with a
+walking bit pattern, intending to verify and then restore it. The very next
+step is a **flash write test, which cannot pass on this core**: the flash is
+currently read-only, faithful to the DuckStation-SB reference (`konami.cpp`
+ignores flash data writes), whereas the real board has four writable Fujitsu
+29F016A chips (MAME `konamigv.cpp:697-706`). The game reports
+`FLASH-ROM CHECK: BAD` and aborts test-mode entry **without ever restoring
+the EEPROM** — and since the core faithfully persists EEPROM writes to
+`simpbowl.sav`, your security code is now gone. Every subsequent boot ends
+at the security code error screen.
+
+Recovery: overwrite `/media/fat/games/PSX/573/simpbowl.sav` with your backup
+and reboot the core. (Holding SERVICE+TEST — the MAME-documented fresh-EEPROM
+init — does not help: that path aborts at the same flash check.)
+
+A proper fix (a 29F016A write path matching MAME's flash emulation, which
+would make the operator/test menu actually reachable) is designed in
+`docs/FLASH_WRITE_DESIGN.md` and in progress.
+
 ## What this board is
 
 ```
@@ -56,8 +81,10 @@ both timing corners met on the shipping build).
 | 4×2 MB flash from DDR3 | ✅ tested on hw | read-wait design; 16-bit address-register writes reassembled |
 | EEPROM window + save mount | ✅ tested on hw | auto-load on mount, dirty write-back, security check passes |
 | EXP1 sub-word semantics | ✅ tested on hw | byte/16/32-bit lanes match konami.cpp exactly; MEMCTRL bus-width reconfig ignored (as the reference does) |
-| JAMMA inputs (pad→P1 map) | ✅ tested on hw | start/buttons play the game |
-| Trackball | 🏗️ functional, feel WIP | mouse-driven; per-packet edge fix + OSD speed divider (1x…1/8) |
+| JAMMA inputs (pad→P1 map) | ✅ tested on hw | start/buttons play; Select = COIN1, R2 = SERVICE1 (per `konamigv.cpp` INPUT_PORTS) |
+| Trackball | ✅ tested on hw | mouse-driven; per-packet edge fix, OSD speed divider (1x…1/8) + OSD invert (X/Y/X+Y) |
+| Service Mode (TEST switch) | ⚠️ delivery works, menu blocked | OSD toggle reaches the game (P1 bit 12), but test-mode entry dies at the flash write check — **see the EEPROM warning above**; fix designed in `docs/FLASH_WRITE_DESIGN.md` |
+| Flash writes (29F016A program/erase) | 🏗️ in progress | read path is done/tested; write path per MAME `intelfsh` is the current work item |
 | On-chip telemetry | ✅ kept aboard | access-ring/IRQ counters emitted via disc-fd marker channel |
 | Other GV titles (8 more) | 📋 untested | same device set; expected close |
 | Dead Eye light gun (GUNX/GUNY) | ❌ not implemented | only GV title needing it |
@@ -80,7 +107,9 @@ image, and a Mode-1/2048 disc image of your disc.
    disc image anywhere reachable.
 3. Launch via the MGL in `mgl/` (mounts EEPROM, flash, and disc in one
    shot). OSD: `Load 573 Flash` (F2), `Mount 573 Disc` (S4),
-   `573 EEPROM Save` (S0), `Trackball Speed`.
+   `573 EEPROM Save` (S0), `Trackball Speed`, `Trackball Invert`,
+   `Service Mode` (**read the EEPROM warning at the top first**).
+4. Back up your working `simpbowl.sav` now, while it's known-good.
 
 ## Building / testing
 
