@@ -820,9 +820,12 @@ begin
                         ScsiRegs(REG_STATUS) <= ScsiRegs(REG_STATUS) and x"7F";  -- clear bit 0x80
                      end if;
 
-                  when 16#10# =>                                   -- P1 0x100000 / P2 0x100004
+                  when 16#10# =>                                   -- P1 0x100000 / P2 0x100004 / P3+P4 0x100008
                      ms_p1 <= '1';
-                     if bus_addr(2) = '1' then
+                     if bus_addr(3) = '1' then
+                        bus_dataRead <= (others => '1');            -- P3_P4 (konamigv.cpp:405/648): all active-low idle
+                                                                    -- (was aliased onto P1 - phantom-input hazard)
+                     elsif bus_addr(2) = '1' then
                         bus_dataRead <= (others => '1');            -- P2 = 0xFF
                      else
                         -- lane by CPU-access byte-step, not address (konami.cpp returns the full
@@ -910,8 +913,13 @@ begin
                         else
                            bus_dataRead <= (others => '0');
                         end if;
+                     elsif bus_addr(7 downto 4) = "0000" then
+                        -- 0x680000-0x0F: MB89371 debug DUART (konamigv.cpp:407-408). Unconnected
+                        -- on a cab; stub as 0xFF so any status poll reads "TX ready" and can
+                        -- never hang a debug-print loop (0x00 = never-ready would).
+                        bus_dataRead <= (others => '1');
                      else
-                        bus_dataRead <= (others => '0');             -- 0x780000 watchdog etc
+                        bus_dataRead <= (others => '0');
                      end if;
 
                   when others => null;                             -- 0x780000 watchdog etc -> 0xFF
