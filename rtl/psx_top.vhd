@@ -354,8 +354,21 @@ architecture arch of psx_top is
    signal memFlash_WE            : std_logic := '0';
    signal memFlash_RD            : std_logic := '0';
 
-   type tFlashState is (FL_IDLE, FL_REQ, FL_RDWAIT, FL_DLWAIT);
+   type tFlashState is (FL_IDLE, FL_REQ, FL_RDWAIT, FL_DLWAIT,
+                        FL_OPREAD, FL_OPRDWAIT, FL_OPMOD, FL_OPWRITE, FL_FILL, FL_FILLNEXT, FL_OPACK);
    signal flashState             : tFlashState := FL_IDLE;
+
+   -- 29F016A write ops from konami573 (docs/FLASH_WRITE_DESIGN.md): program = line RMW with
+   -- AND semantics (flash programs 1->0), erase = lane-masked 0xFF streaming fill.
+   signal flash_op_req           : std_logic;
+   signal flash_op_fill          : std_logic;
+   signal flash_op_addr          : std_logic_vector(23 downto 0);
+   signal flash_op_len           : unsigned(21 downto 0);
+   signal flash_op_data          : std_logic_vector(7 downto 0);
+   signal flash_op_lane          : std_logic;
+   signal flash_op_done          : std_logic := '0';
+   signal fl_op_cnt              : unsigned(19 downto 0) := (others => '0');   -- fill lines remaining
+   signal fl_op_line             : std_logic_vector(63 downto 0) := (others => '0'); -- RMW latched line
    signal fl_isWrite             : std_logic := '0';
    signal fl_lane                : unsigned(1 downto 0) := "00";
    signal flash_fetch_q          : std_logic := '0';
@@ -1083,6 +1096,7 @@ begin
             memFlash_RD      <= '0';
             memFlash_WE      <= '0';
             flash_dl_done    <= '0';
+            flash_op_done    <= '0';
             flash_rdaddr     <= (others => '1');   -- fix A: no FA valid yet (forces first read to fetch)
          else
             case flashState is
@@ -1102,6 +1116,29 @@ begin
                      memFlash_RD      <= '0';
                      memFlash_request <= '1';
                      flashState       <= FL_REQ;
+                  elsif (flash_op_req = '1' and flash_op_done = '0') then    -- 29F016A program/erase op
+                     if (flash_op_fill = '1') then                           -- erase: lane-masked 0xFF fill
+                        memFlash_ADDR    <= flash_op_addr(22 downto 0) & '0'; -- byte addr; base is sector/chip aligned
+                        memFlash_DIN     <= (others => '1');
+                        if (flash_op_lane = '0') then
+                           memFlash_BE   <= "01010101";                      -- lo chip = even bytes of each word
+                        else
+                           memFlash_BE   <= "10101010";
+                        end if;
+                        memFlash_WE      <= '1';
+                        memFlash_RD      <= '0';
+                        memFlash_request <= '1';
+                        fl_op_cnt        <= resize(flash_op_len(21 downto 2), 20) - 1; -- lines after this one
+                        flashState       <= FL_FILL;
+                     else                                                    -- program: line RMW (AND)
+                        memFlash_ADDR    <= flash_op_addr(22 downto 0) & '0';
+                        fl_lane          <= unsigned(flash_op_addr(1 downto 0));
+                        memFlash_BE      <= (others => '1');
+                        memFlash_WE      <= '0';
+                        memFlash_RD      <= '1';
+                        memFlash_request <= '1';
+                        flashState       <= FL_OPREAD;
+                     end if;
                   elsif (flash_fetch = '1' and flash_fetch_q = '0') then -- runtime read (rising edge)
                      fl_isWrite       <= '0';
                      memFlash_ADDR    <= flash_word_addr(22 downto 0) & '0';  -- byte addr = word << 1
@@ -1150,6 +1187,67 @@ begin
                      flash_rdaddr     <= '0' & memFlash_ADDR(23 downto 1);  -- fix A: publish the FA now valid in flash_data
                      flash_data_ready <= '1';
                      flashState       <= FL_IDLE;
+                  end if;
+
+               -- ===== 29F016A write ops (docs/FLASH_WRITE_DESIGN.md) =====
+               when FL_OPREAD =>                     -- RMW step 1: read the 64-bit line
+                  if (memFlash_ack = '1') then
+                     memFlash_RD <= '0';             -- request stays high through the read beat (spu_ram contract)
+                  end if;
+                  if (ddr3_DOUT_READY = '1') then
+                     memFlash_request <= '0';
+                     fl_op_line       <= ddr3_DOUT;
+                     flashState       <= FL_OPMOD;
+                  end if;
+
+               when FL_OPMOD =>                      -- RMW step 2: AND the target byte, one-hot BE
+                  for i in 0 to 7 loop
+                     if (flash_op_lane = '0' and i = to_integer(fl_lane) * 2) or
+                        (flash_op_lane = '1' and i = to_integer(fl_lane) * 2 + 1) then
+                        memFlash_DIN(i*8+7 downto i*8) <= fl_op_line(i*8+7 downto i*8) and flash_op_data;
+                        memFlash_BE(i)                 <= '1';
+                     else
+                        memFlash_DIN(i*8+7 downto i*8) <= fl_op_line(i*8+7 downto i*8);
+                        memFlash_BE(i)                 <= '0';
+                     end if;
+                  end loop;
+                  memFlash_WE      <= '1';
+                  memFlash_request <= '1';
+                  flashState       <= FL_OPWRITE;
+
+               when FL_OPWRITE =>                    -- RMW step 3: write back
+                  if (memFlash_ack = '1') then
+                     memFlash_WE      <= '0';
+                     memFlash_request <= '0';
+                     flash_rdaddr     <= (others => '1');  -- cached word may now be stale -> force refetch
+                     flash_op_done    <= '1';
+                     flashState       <= FL_OPACK;
+                  end if;
+
+               when FL_FILL =>                       -- erase fill: one line per arbiter transaction
+                  if (memFlash_ack = '1') then
+                     memFlash_WE      <= '0';
+                     memFlash_request <= '0';
+                     if (fl_op_cnt = 0) then
+                        flash_rdaddr  <= (others => '1');
+                        flash_op_done <= '1';
+                        flashState    <= FL_OPACK;
+                     else
+                        fl_op_cnt     <= fl_op_cnt - 1;
+                        flashState    <= FL_FILLNEXT;
+                     end if;
+                  end if;
+
+               when FL_FILLNEXT =>                   -- re-arm the next line (arbiter needs request to drop)
+                  memFlash_ADDR    <= std_logic_vector(unsigned(memFlash_ADDR) + 8);
+                  memFlash_WE      <= '1';
+                  memFlash_request <= '1';
+                  flashState       <= FL_FILL;
+
+               when FL_OPACK =>                      -- 4-phase completion
+                  if (flash_op_req = '0') then
+                     flash_op_done <= '0';
+                     flashState    <= FL_IDLE;
                   end if;
 
             end case;
@@ -1939,6 +2037,13 @@ begin
       flash_data_ready     => flash_data_ready,
       flash_rdaddr         => flash_rdaddr,
       bus_exp1_wait        => bus_exp1_wait_s,
+      flash_op_req         => flash_op_req,
+      flash_op_fill        => flash_op_fill,
+      flash_op_addr        => flash_op_addr,
+      flash_op_len         => flash_op_len,
+      flash_op_data        => flash_op_data,
+      flash_op_lane        => flash_op_lane,
+      flash_op_done        => flash_op_done,
 
       eeprom_load          => eeprom_load,
       eeprom_save          => eeprom_save,
