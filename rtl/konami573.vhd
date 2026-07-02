@@ -190,6 +190,54 @@ architecture arch of konami573 is
    signal eep_addr_b : std_logic_vector(5 downto 0);
    signal eep_wren_b : std_logic;
 
+   -- ===== 93C46 serial EEPROM interface (MAME konamigv.cpp:406/582/624/667-670) =====
+   -- Real GV hardware exposes the EEPROM ONLY as a serial 93C46 (16-bit org, 64 words):
+   -- writes bit-bang 0x1F180000 (bit0=DI, bit1=CS, bit2=CLK), readback = P1 bit 0x2000
+   -- (ACTIVE_HIGH do_read). The 128-byte flat window at 0x1F180080 (DuckStation-SB
+   -- konami.cpp:395-421, hardware-proven for the game's security check) is served from the
+   -- SAME dpram, so both views stay coherent. Protocol per MAME machine/eepromser.cpp
+   -- (93cxx, non-streaming): start bit + 2-bit opcode + 6-bit address; READ shifts a dummy
+   -- 0 then data MSB-first; WRITE/ERASE/xxALL respect the EWEN/EWDS lock; program/erase
+   -- complete instantly (DO=ready=1).
+   type tSerState is (SER_RESET, SER_START, SER_CMD, SER_READ, SER_WDATA, SER_DONE);
+   signal ser_state  : tSerState := SER_RESET;
+   signal ser_di     : std_logic := '0';
+   signal ser_cs     : std_logic := '0';
+   signal ser_clk    : std_logic := '0';
+   signal ser_ln_new : std_logic_vector(2 downto 0) := "000";     -- staged new line levels (clk & cs & di)
+   signal ser_ev     : std_logic := '0';                          -- a port write landed; process edges
+   signal ser_cmdacc : unsigned(7 downto 0) := (others => '0');   -- start-stripped: 2 opcode + 6 address
+   signal ser_bits   : integer range 0 to 31 := 0;
+   signal ser_addr   : unsigned(5 downto 0) := (others => '0');
+   signal ser_shift  : std_logic_vector(15 downto 0) := (others => '0');
+   signal ser_do     : std_logic := '1';
+   signal ser_locked : std_logic := '1';                          -- powers up write-locked (EWEN required)
+   signal ser_wall   : std_logic := '0';                          -- pending data write is WRITEALL
+   -- dpram port B micro-ops (shared with the HPS save FSM; serial defers while HPS active)
+   signal ser_b_addr  : unsigned(5 downto 0) := (others => '0');
+   signal ser_b_wdata : std_logic_vector(15 downto 0) := (others => '0');
+   signal ser_b_wren  : std_logic := '0';
+   signal ser_word    : std_logic_vector(15 downto 0) := (others => '0'); -- prefetched READ word
+   signal ser_pf_cnt  : integer range 0 to 3 := 0;                -- prefetch latency countdown
+   signal ser_dirty   : std_logic := '0';                         -- pulse -> eeprom_dirty (autosave)
+   -- bulk ERASEALL/WRITEALL micro-loop
+   signal ser_bulk    : std_logic := '0';
+   signal ser_bulk_wall : std_logic := '0';
+   signal ser_bulk_idx  : unsigned(5 downto 0) := (others => '0');
+   signal ser_bulk_ph   : integer range 0 to 2 := 0;
+   signal ee_q_b      : std_logic_vector(15 downto 0);
+   signal eep_hps_act : std_logic;
+   signal eep_data_b_mux : std_logic_vector(15 downto 0);
+   signal eep_wren_b_mux : std_logic;
+
+   -- write-capture ring (8 deep, WRITES ONLY): the 16-deep access ring is evicted by a
+   -- single 14-read input-poll burst, which has hidden the interesting write sequences
+   -- three investigations in a row. This ring holds the last 8 writes to the EEPROM
+   -- region (incl. the serial bit-bang at offset 0) and the flash window.
+   type tWRing is array(0 to 7) of std_logic_vector(17 downto 0);
+   signal wring    : tWRing := (others => (others => '0'));
+   signal wring_wr : unsigned(2 downto 0) := (others => '0');
+
    -- EEPROM save-mount FSM (memcard-modeled, no DDR3 leg — the EEPROM lives in the dpram here)
    type tEepState is (EE_IDLE, EE_LOAD_WSTART, EE_LOAD_WDONE, EE_SAVE_WSTART, EE_SAVE_WDONE);
    signal eepState     : tEepState := EE_IDLE;
@@ -298,8 +346,11 @@ begin
 
    -- P1 inputs assembled combinationally (active-low), per konami.cpp bit masks +
    -- konamigv.cpp operator inputs: 0x400 COIN1, 0x800 SERVICE1, 0x1000 TEST switch
-   -- (PORT_SERVICE_NO_TOGGLE). Bit 13 = EEPROM DO line -- stays '1' (konami.cpp).
-   p1val(31 downto 13) <= (others => '1');
+   -- (PORT_SERVICE_NO_TOGGLE).
+   p1val(31 downto 14) <= (others => '1');
+   -- Bit 13 = 93C46 DO (konamigv.cpp:624: P1 bit 0x2000 ACTIVE_HIGH do_read). Idle/ready = 1
+   -- (matches the constant '1' konami.cpp implied, so normal boot behavior is unchanged).
+   p1val(13) <= ser_do;
    p1val(12) <= '0' when (CurrentButtons(2) = '1') else '1';  -- TEST  (0x1000, OSD Service Mode level)
    p1val(11) <= '0' when (CurrentButtons(1) = '1') else '1';  -- SERVICE1 (0x800, pad R2)
    p1val(10) <= '0' when (CurrentButtons(0) = '1') else '1';  -- COIN1 (0x400, pad Select)
@@ -340,15 +391,27 @@ begin
          end if;
       end if;
    end process;
-   ee_wren <= '1' when (ce = '1' and bus_write = '1' and region = 16#18#) else '0';
+   -- WINDOW ONLY (offsets 0x80-0xFF): konami.cpp KonamiEepromWrite guards
+   -- Offset >= 0x180080 && < 0x180100; writes below 0x80 are the SERIAL PORT, not array
+   -- data. (The old unguarded form let the boot's bit-bang writes at offset 0 alias into
+   -- array bytes 0-3 - byte 0 of every .sav was really the last serial-port value.)
+   ee_wren <= '1' when (ce = '1' and bus_write = '1' and region = 16#18# and
+                        bus_addr(15 downto 7) = "000000001") else '0';
    -- Port B tracks the sd_buff word address; only the first 64 words (128 B) are the EEPROM.
-   eep_addr_b <= eeprom_addr(5 downto 0);
-   eep_wren_b <= (eeprom_write and eeprom_ack and eep_loading) when eeprom_addr(8 downto 6) = "000" else '0';
+   -- Muxed with the 93C46 serial FSM's micro-ops: the HPS load/save FSM owns the port
+   -- while active (mount-time load / dirty flush), the serial FSM defers meanwhile.
+   eep_hps_act <= '0' when eepState = EE_IDLE else '1';
+   eep_addr_b     <= eeprom_addr(5 downto 0) when eep_hps_act = '1' else std_logic_vector(ser_b_addr);
+   eep_data_b_mux <= eeprom_dataIn when eep_hps_act = '1' else ser_b_wdata;
+   eep_wren_b     <= ser_b_wren when eep_hps_act = '0' else
+                     (eeprom_write and eeprom_ack and eep_loading) when eeprom_addr(8 downto 6) = "000" else
+                     '0';
+   eeprom_dataOut <= ee_q_b;
    ieeprom : entity work.dpram_dif
       generic map (addr_width_a => 7, data_width_a => 8, addr_width_b => 6, data_width_b => 16)
       port map (
          clock_a => clk1x, clken_a => ce, address_a => ee_addr, data_a => bus_dataWrite, wren_a => ee_wren, q_a => ee_q,
-         clock_b => clk1x, address_b => eep_addr_b, data_b => eeprom_dataIn, wren_b => eep_wren_b, q_b => eeprom_dataOut
+         clock_b => clk1x, address_b => eep_addr_b, data_b => eep_data_b_mux, wren_b => eep_wren_b, q_b => ee_q_b
       );
 
    -- Sector buffer. Port B is filled AUTOMATICALLY from the HPS sd_buff stream during the
@@ -483,7 +546,7 @@ begin
 
             -- A game EEPROM write always wins (placed after the case) so a write coinciding with
             -- a save/load completion never silently loses the dirty flag.
-            if ee_wren = '1' then eeprom_dirty <= '1'; end if;
+            if ee_wren = '1' or ser_dirty = '1' then eeprom_dirty <= '1'; end if;
          end if;
       end if;
    end process;
@@ -537,6 +600,18 @@ begin
             opq_wr       <= 0;
             flash_op_req <= '0';
             fl_rdpend    <= '0';
+            ser_state    <= SER_RESET;
+            ser_di       <= '0';
+            ser_cs       <= '0';
+            ser_clk      <= '0';
+            ser_ev       <= '0';
+            ser_do       <= '1';
+            ser_locked   <= '1';
+            ser_b_wren   <= '0';
+            ser_pf_cnt   <= 0;
+            ser_dirty    <= '0';
+            ser_bulk     <= '0';
+            wring_wr     <= (others => '0');
             ScsiRegs     <= (others => (others => '0'));
             bus_dataRead <= (others => '1');
             discState    <= D_IDLE;
@@ -654,6 +729,22 @@ begin
                ring_wr <= ring_wr + 1;
             end if;
 
+            -- write-capture ring: last 8 WRITES to the EEPROM region (serial bit-bang at
+            -- offset 0-3 + window) and the flash window. Never frozen, never evicted by
+            -- input polls - the evidence the 16-deep access ring keeps losing.
+            -- entry = regbit(1: 0=0x18, 1=0x68) & offset(7:0) & data(7:0) & bstep(1)
+            if bus_write = '1' and (region = 16#18# or
+                                    (region = 16#68# and bus_addr(7 downto 4) = "1000")) then
+               if region = 16#18# then
+                  wring(to_integer(wring_wr)) <= '0' & std_logic_vector(bus_addr(7 downto 0)) &
+                                                 bus_dataWrite & bus_bstep(0);
+               else
+                  wring(to_integer(wring_wr)) <= '1' & std_logic_vector(bus_addr(7 downto 0)) &
+                                                 bus_dataWrite & bus_bstep(0);
+               end if;
+               wring_wr <= wring_wr + 1;
+            end if;
+
             if ms_read10 = '1' and diag_wait /= (diag_wait'range => '1') then
                diag_wait <= diag_wait + 1;   -- saturating ~8s arm delay after disc loading begins
             end if;
@@ -664,12 +755,22 @@ begin
             if (dbg_pc_cnt = 0 and discState = D_IDLE and fetchStart = '0') then
                if ring_frozen = '1' then
                   fetchStart  <= '1'; bufferValid <= '0';
-                  if emit_idx = 16 then
+                  if emit_idx >= 17 then
+                     -- write-capture ring, oldest first: lba = "11" & idx(2:0) & '0' & entry(17:0)
+                     ScsiSectorLba <= unsigned(std_logic_vector'(x"00" & "11" &
+                                               std_logic_vector(emit_idx(2 downto 0)) & '0' &
+                                               wring(to_integer(wring_wr + emit_idx(2 downto 0)))));
+                     if emit_idx = 24 then
+                        emit_idx <= (others => '0');
+                     else
+                        emit_idx <= emit_idx + 1;
+                     end if;
+                  elsif emit_idx = 16 then
                      -- IRQ10 delivery diag: "10" & rise(7:0) & fall(7:0) & "000000"
                      ScsiSectorLba <= unsigned(std_logic_vector'(x"00" & "10" &
                                                std_logic_vector(irq10_rise_cnt) &
                                                std_logic_vector(irq10_fall_cnt) & "000000"));
-                     emit_idx <= (others => '0');
+                     emit_idx <= emit_idx + 1;
                   else
                      if emit_idx = 15 then
                         ScsiSectorLba <= unsigned(std_logic_vector'(x"00" & "011111" & "00" &
@@ -682,12 +783,25 @@ begin
                      emit_idx <= emit_idx + 1;
                   end if;
                elsif diag_wait = (diag_wait'range => '1') then
-                  -- not frozen long after disc loading: report WHO keeps resetting the quiet
-                  -- counter. lba = "10" & last_region(6:0) & ring_wr(3:0) & quiet_cnt(23:13)
+                  -- not frozen long after disc loading: alternate the who-resets-quiet diag
+                  -- with the write-capture ring (which showed nothing in this mode before -
+                  -- exactly the blind spot of the boot#3 black-screen investigation).
                   fetchStart  <= '1'; bufferValid <= '0';
-                  ScsiSectorLba <= unsigned(std_logic_vector'(x"00" & "10" & last_region &
-                                            std_logic_vector(ring_wr) &
-                                            std_logic_vector(quiet_cnt(23 downto 13))));
+                  if emit_idx = 0 or emit_idx > 8 then
+                     ScsiSectorLba <= unsigned(std_logic_vector'(x"00" & "10" & last_region &
+                                               std_logic_vector(ring_wr) &
+                                               std_logic_vector(quiet_cnt(23 downto 13))));
+                     emit_idx <= to_unsigned(1, emit_idx'length);
+                  else
+                     ScsiSectorLba <= unsigned(std_logic_vector'(x"00" & "11" &
+                                               std_logic_vector(emit_idx(2 downto 0) - 1) & '0' &
+                                               wring(to_integer(wring_wr + emit_idx(2 downto 0) - 1))));
+                     if emit_idx = 8 then
+                        emit_idx <= (others => '0');
+                     else
+                        emit_idx <= emit_idx + 1;
+                     end if;
+                  end if;
                end if;
             end if;
 
@@ -723,7 +837,9 @@ begin
 
                   when 16#18# =>                                   -- EEPROM 0x180080-0x1800FF
                      ms_eeprom <= '1';
-                     if bus_bstep(1) = '1' then
+                     if bus_addr(15 downto 7) /= "000000001" then
+                        bus_dataRead <= (others => '0');           -- outside the window: konami.cpp returns 0 (serial port reads back nothing)
+                     elsif bus_bstep(1) = '1' then
                         bus_dataRead <= (others => '0');           -- 32-bit read upper half: konami.cpp zero-extends the u16
                      else
                         bus_dataRead <= ee_q;
@@ -887,6 +1003,18 @@ begin
                      ScsiRegs(REG_IRQSTATE) <= v_irqstate;
                      if v_irq = '1' then irq10_set <= '1'; end if;
 
+                  when 16#18# =>
+                     -- 93C46 serial port (konamigv.cpp:406 portw EEPROMOUT @0x1F180000;
+                     -- bits 0x01=DI 0x02=CS 0x04=CLK per konamigv.cpp:667-670). Only the
+                     -- port's low byte carries the lines; window writes (0x80+) go through
+                     -- ee_wren. Latch the new line levels; edges are processed by the
+                     -- serial FSM section below in MAME's port order (DI level, CS edge,
+                     -- CLK edge - all from this one write).
+                     if bus_addr(15 downto 2) = "00000000000000" and bus_bstep(0) = '0' then
+                        ser_ln_new <= bus_dataWrite(2 downto 0);   -- clk & cs & di
+                        ser_ev     <= '1';                         -- FSM section consumes next ce
+                     end if;
+
                   when 16#68# =>                                   -- flash address writes (0x82/0x84/0x86)
                      -- konami.cpp (KonamiFlashWrite, konami.cpp:369-391) gets ONE call with the
                      -- full 16-bit Value: wr@2 FA=Val<<1 (reaches bit16), wr@4 |=Val<<8 (bit23),
@@ -1003,6 +1131,156 @@ begin
             -- release the pending-fetch level once the stalled array read can complete
             if fl_rdpend = '1' and opq_any = '0' and flash_rdaddr = std_logic_vector(FlashAddress) then
                fl_rdpend <= '0';
+            end if;
+
+            ------------------------------------------------------------------
+            -- 93C46 serial EEPROM FSM (MAME eepromser.cpp 93cxx, non-streaming).
+            -- One port write can carry a DI level change + CS edge + CLK edge;
+            -- MAME processes them in port-bit order (DI, CS, CLK) - mirrored here.
+            ------------------------------------------------------------------
+            ser_b_wren <= '0';
+            ser_dirty  <= '0';
+            if ser_pf_cnt /= 0 then                       -- READ-word prefetch pipeline (dpram port B)
+               if eep_hps_act = '0' then
+                  ser_pf_cnt <= ser_pf_cnt - 1;
+                  if ser_pf_cnt = 1 then
+                     ser_word <= ee_q_b;
+                  end if;
+               end if;
+            end if;
+
+            if ser_ev = '1' then
+               ser_ev  <= '0';
+               ser_di  <= ser_ln_new(0);
+               ser_cs  <= ser_ln_new(1);
+               ser_clk <= ser_ln_new(2);
+
+               -- CS falling edge: any state -> RESET, DO idles high (ready)
+               if ser_cs = '1' and ser_ln_new(1) = '0' then
+                  ser_state <= SER_RESET;
+                  ser_do    <= '1';
+               -- CS rising edge: leave reset
+               elsif ser_cs = '0' and ser_ln_new(1) = '1' then
+                  if ser_state = SER_RESET then
+                     ser_state <= SER_START;
+                  end if;
+               -- CLK rising edge with CS held high
+               elsif ser_ln_new(1) = '1' and ser_clk = '0' and ser_ln_new(2) = '1' then
+                  case ser_state is
+                     when SER_START =>                    -- wait for start bit (DI=1)
+                        if ser_ln_new(0) = '1' then
+                           ser_cmdacc <= (others => '0');
+                           ser_bits   <= 0;
+                           ser_state  <= SER_CMD;
+                        end if;
+                     when SER_CMD =>                      -- accumulate 2 opcode + 6 address bits
+                        ser_cmdacc <= ser_cmdacc(6 downto 0) & ser_ln_new(0);
+                        if ser_bits = 7 then
+                           ser_bits <= 0;
+                           -- parse (eepromser.cpp parse_command_and_address; addr = low 6 of the accum incl. this bit)
+                           ser_addr <= ser_cmdacc(4 downto 0) & ser_ln_new(0);
+                           case ser_cmdacc(6 downto 5) is
+                              when "01" =>                -- WRITE: collect 16 data bits
+                                 ser_shift <= (others => '0');
+                                 ser_wall  <= '0';
+                                 ser_state <= SER_WDATA;
+                              when "10" =>                -- READ: dummy 0 then data MSB-first
+                                 ser_do    <= '0';
+                                 ser_state <= SER_READ;
+                                 -- prefetch the word; the pipeline below defers while the
+                                 -- HPS owns port B (bit-bang CLK gaps are thousands of ce)
+                                 ser_b_addr <= ser_cmdacc(4 downto 0) & ser_ln_new(0);
+                                 ser_pf_cnt <= 3;
+                              when "11" =>                -- ERASE: word -> 0xFFFF
+                                 if ser_locked = '0' then
+                                    ser_b_addr  <= ser_cmdacc(4 downto 0) & ser_ln_new(0);
+                                    ser_b_wdata <= (others => '1');
+                                    ser_b_wren  <= '1';
+                                    ser_dirty   <= '1';
+                                    ser_state   <= SER_DONE;
+                                 else
+                                    ser_state <= SER_RESET;
+                                 end if;
+                              when others =>              -- 00: sub-op in address bits 5:4 (= accum bits 4:3 here)
+                                 case to_integer(ser_cmdacc(4 downto 3)) is
+                                    when 0      => ser_locked <= '1'; ser_state <= SER_RESET; -- EWDS/LOCK
+                                    when 1      =>                                            -- WRITEALL
+                                       ser_shift <= (others => '0');
+                                       ser_wall  <= '1';
+                                       ser_state <= SER_WDATA;
+                                    when 2      =>                                            -- ERASEALL
+                                       if ser_locked = '0' then
+                                          ser_bulk      <= '1';
+                                          ser_bulk_wall <= '0';
+                                          ser_bulk_idx  <= (others => '0');
+                                          ser_bulk_ph   <= 0;
+                                          ser_dirty     <= '1';
+                                       end if;
+                                       ser_state <= SER_DONE;
+                                    when others => ser_locked <= '0'; ser_state <= SER_RESET; -- EWEN/UNLOCK
+                                 end case;
+                           end case;
+                        else
+                           ser_bits <= ser_bits + 1;
+                        end if;
+                     when SER_READ =>                     -- shift data out, MSB first; >16 bits shift 1s
+                        if ser_bits = 0 then
+                           ser_do    <= ser_word(15);
+                           ser_shift <= ser_word(14 downto 0) & '1';
+                        else
+                           ser_do    <= ser_shift(15);
+                           ser_shift <= ser_shift(14 downto 0) & '1';
+                        end if;
+                        if ser_bits /= 31 then ser_bits <= ser_bits + 1; end if;
+                     when SER_WDATA =>                    -- shift data in; execute at 16 bits
+                        ser_shift <= ser_shift(14 downto 0) & ser_ln_new(0);
+                        if ser_bits = 15 then
+                           ser_bits <= 0;
+                           if ser_locked = '1' then
+                              ser_state <= SER_RESET;
+                           elsif ser_wall = '1' then      -- WRITEALL: bulk AND-write (eepromser.cpp comment)
+                              ser_bulk      <= '1';
+                              ser_bulk_wall <= '1';
+                              ser_bulk_idx  <= (others => '0');
+                              ser_bulk_ph   <= 0;
+                              ser_dirty     <= '1';
+                              ser_state     <= SER_DONE;
+                           else
+                              ser_b_addr  <= ser_addr;
+                              ser_b_wdata <= ser_shift(14 downto 0) & ser_ln_new(0);
+                              ser_b_wren  <= '1';
+                              ser_dirty   <= '1';
+                              ser_state   <= SER_DONE;    -- instant completion; DO=1 = ready
+                              ser_do      <= '1';
+                           end if;
+                        else
+                           ser_bits <= ser_bits + 1;
+                        end if;
+                     when others => null;                 -- SER_RESET (CS low history) / SER_DONE: ignore clocks
+                  end case;
+               end if;
+            end if;
+
+            -- bulk ERASEALL / WRITEALL micro-loop (64 words; defers while the HPS owns port B)
+            if ser_bulk = '1' and eep_hps_act = '0' and ser_b_wren = '0' and ser_pf_cnt = 0 then
+               if ser_bulk_wall = '0' then                -- ERASEALL: one word per ce
+                  ser_b_addr  <= ser_bulk_idx;
+                  ser_b_wdata <= (others => '1');
+                  ser_b_wren  <= '1';
+                  if ser_bulk_idx = 63 then ser_bulk <= '0'; end if;
+                  ser_bulk_idx <= ser_bulk_idx + 1;
+               else                                       -- WRITEALL: read-AND-write per word
+                  case ser_bulk_ph is
+                     when 0 => ser_b_addr <= ser_bulk_idx; ser_bulk_ph <= 1;
+                     when 1 => ser_bulk_ph <= 2;          -- dpram read latency
+                     when 2 =>
+                        ser_b_wdata <= ee_q_b and ser_shift;
+                        ser_b_wren  <= '1';
+                        ser_bulk_ph <= 0;
+                        if ser_bulk_idx = 63 then ser_bulk <= '0'; end if;
+                        ser_bulk_idx <= ser_bulk_idx + 1;
+                  end case;
+               end if;
             end if;
 
             ------------------------------------------------------------------
