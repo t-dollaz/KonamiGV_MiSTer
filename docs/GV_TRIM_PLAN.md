@@ -19,7 +19,7 @@ the operator/TEST menu is confirmed working on hardware.
 | Controller device emulation | joypad_pad.vhd (digital/analog/mouse/GunCon/NeGcon/multitap models) | GV inputs = JAMMA via EXP1; our button wiring taps the joypad1 input record in PSX.sv, not the SIO device | TBD |
 | Savestates + rewind | savestates.vhd, statemanager.vhd, savestate_ui.sv, ~200 SS_* points in psx_top, DDR3 SS region | arcade-meaningless; frees ddr3_savestate arbiter gating; our flash region overlaps it | TBD |
 | Cheat engine | cheats.vhd + OSD | nothing to cheat; frees BRAM | TBD |
-| PSX lightgun (GunCon/Justifier) | justifier_sensor.vhd, gpu_crosshair.vhd, Gun1X/Y | Dead Eye's gun is EXP1 memory-mapped (GUNX1 @0x1F680080, konamigv.cpp:437), not a PSX gun | TBD |
+| PSX gun DEVICE emulation only | the GunCon/Justifier device models inside joypad_pad.vhd (leave with it) | Dead Eye's gun is EXP1 memory-mapped (GUNX1 @0x1F680080, konamigv.cpp:437), not a PSX pad-bus gun | (part of joypad_pad) |
 | BIOS patching | fastboot / PATCHSERIAL in memorymux | Sony-BIOS offsets; corrupts the GV BIOS if ever enabled | ~0 (safety) |
 
 ## Keep a faithful skeleton — BIOS/game touches it
@@ -64,7 +64,12 @@ memcard-less, PSX-pad-less — board-confirmed). But full coverage needs:
   home for those titles' persistence.
 - **GUNX/GUNY ports + framework lightgun coords** (Dead Eye): EXP1
   memory-mapped (konamigv.cpp:437-440) fed from MiSTer analog/lightgun
-  inputs — NOT the removed PSX GunCon device (removal still safe).
+  inputs. KEEP justifier_sensor.vhd + gpu_crosshair.vhd (~trivial ALMs):
+  the crosshair overlay serves USB-gun play directly, and the Justifier
+  beam-timing conversion is the proven seed for emulating the daughtercard's
+  pulse->coordinate circuit if real photodiode-gun-on-CRT (SNAC) support is
+  ever wanted. Only the GunCon/Justifier PAD-BUS device models (inside
+  joypad_pad) are removed.
 - **Tokimeki specialty I/O** (heartbeat/GSR/printer): niche; explicitly out
   of scope unless someone asks.
 
