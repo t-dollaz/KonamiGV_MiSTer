@@ -217,6 +217,8 @@ entity psx_top is
 
       MouseEvent            : in  std_logic;
       tball_speed           : in  std_logic_vector(1 downto 0);
+      tball_invert          : in  std_logic_vector(1 downto 0);
+      service_mode          : in  std_logic;
       MouseLeft             : in  std_logic;
       MouseRight            : in  std_logic;
       MouseX                : in  signed(8 downto 0);
@@ -1884,6 +1886,9 @@ begin
                       13 => joypad1.KeyCircle,
                       14 => joypad1.KeyCross,
                        3 => joypad1.KeyStart,
+                       0 => joypad1.KeySelect,   -- COIN1  (p1val bit 10, konamigv.cpp 0x400)
+                       1 => joypad1.KeyR2,       -- SERVICE1 (p1val bit 11, 0x800)
+                       2 => service_mode,        -- TEST switch (p1val bit 12, 0x1000; OSD level)
                       others => '0');
    konami_buttons <= not konami_btn_ah;
 
@@ -1906,6 +1911,7 @@ begin
       irq10_rise_cnt       => irq10_rise_cnt,
       irq10_fall_cnt       => irq10_fall_cnt,
       tball_speed          => tball_speed,
+      tball_invert         => tball_invert,
       bus_dataWrite        => bus_exp1_dataWrite,
       bus_read             => bus_exp1_read,
       bus_write            => bus_exp1_write,

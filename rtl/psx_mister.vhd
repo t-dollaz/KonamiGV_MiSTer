@@ -258,6 +258,8 @@ entity psx_mister is
       -- mouse
       MouseEvent            : in  std_logic;
       tball_speed           : in  std_logic_vector(1 downto 0);
+      tball_invert          : in  std_logic_vector(1 downto 0);
+      service_mode          : in  std_logic;
       MouseLeft             : in  std_logic;
       MouseRight            : in  std_logic;
       MouseX                : in  signed(8 downto 0);
@@ -663,6 +665,8 @@ begin
 
       MouseEvent            => MouseEvent,
       tball_speed           => tball_speed,
+      tball_invert          => tball_invert,
+      service_mode          => service_mode,
       MouseLeft             => MouseLeft,
       MouseRight            => MouseRight,
       MouseX                => MouseX,

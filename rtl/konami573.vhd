@@ -29,6 +29,7 @@ entity konami573 is
       irq10_rise_cnt : in unsigned(7 downto 0) := (others => '0');  -- IRQ10 latched into I_STAT (from psx_top counter)
       irq10_fall_cnt : in unsigned(7 downto 0) := (others => '0');  -- IRQ10 acked by CPU
       tball_speed   : in  std_logic_vector(1 downto 0) := "00";     -- OSD trackball sensitivity: delta >> speed (1x,1/2,1/4,1/8)
+      tball_invert  : in  std_logic_vector(1 downto 0) := "00";     -- OSD trackball invert: bit0=X, bit1=Y
       bus_dataWrite : in  std_logic_vector(7 downto 0);
       bus_read      : in  std_logic;
       bus_write     : in  std_logic;
@@ -223,8 +224,13 @@ begin
    bsel    <= to_integer(bus_addr(1 downto 0));
    CurrentButtons <= buttons xor x"FFFFFFFF";
 
-   -- P1 inputs assembled combinationally (active-low), per konami.cpp bit masks
-   p1val(31 downto 10) <= (others => '1');
+   -- P1 inputs assembled combinationally (active-low), per konami.cpp bit masks +
+   -- konamigv.cpp operator inputs: 0x400 COIN1, 0x800 SERVICE1, 0x1000 TEST switch
+   -- (PORT_SERVICE_NO_TOGGLE). Bit 13 = EEPROM DO line -- stays '1' (konami.cpp).
+   p1val(31 downto 13) <= (others => '1');
+   p1val(12) <= '0' when (CurrentButtons(2) = '1') else '1';  -- TEST  (0x1000, OSD Service Mode level)
+   p1val(11) <= '0' when (CurrentButtons(1) = '1') else '1';  -- SERVICE1 (0x800, pad R2)
+   p1val(10) <= '0' when (CurrentButtons(0) = '1') else '1';  -- COIN1 (0x400, pad Select)
    p1val(9)  <= '0' when (CurrentButtons(3) = '1' or CurrentButtons(8) = '1' or
                           CurrentButtons(10) = '1' or CurrentButtons(11) = '1') else '1'; -- START (0x0D08)
    p1val(8)  <= '1';
@@ -885,8 +891,16 @@ begin
                -- pulse: level-accumulating added each delta every ce cycle the toggle sat high
                -- (~16M adds/packet -> instant +/-2048 saturation = "hypersensitive Y, dead X").
                -- Count each packet ONCE (either edge) and scale by the OSD trackball speed.
-               v_tx := resize(TrackballX, 13) + resize(shift_right(mouse_x, to_integer(unsigned(tball_speed))), 13);
-               v_ty := resize(TrackballY, 13) + resize(shift_right(mouse_y, to_integer(unsigned(tball_speed))), 13);
+               if tball_invert(0) = '1' then
+                  v_tx := resize(TrackballX, 13) - resize(shift_right(mouse_x, to_integer(unsigned(tball_speed))), 13);
+               else
+                  v_tx := resize(TrackballX, 13) + resize(shift_right(mouse_x, to_integer(unsigned(tball_speed))), 13);
+               end if;
+               if tball_invert(1) = '1' then
+                  v_ty := resize(TrackballY, 13) - resize(shift_right(mouse_y, to_integer(unsigned(tball_speed))), 13);
+               else
+                  v_ty := resize(TrackballY, 13) + resize(shift_right(mouse_y, to_integer(unsigned(tball_speed))), 13);
+               end if;
                if    v_tx >  2047 then TrackballX <= to_signed( 2047, 12);
                elsif v_tx < -2048 then TrackballX <= to_signed(-2048, 12);
                else                    TrackballX <= resize(v_tx, 12); end if;
