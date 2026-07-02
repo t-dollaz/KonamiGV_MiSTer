@@ -1,228 +1,114 @@
-# [Playstation](https://en.wikipedia.org/wiki/PlayStation_(console)) for [MiSTer Platform](https://github.com/MiSTer-devel/Main_MiSTer/wiki)
+# Konami GV ("Baby Phoenix") — MiSTer FPGA core
 
-## Hardware Requirements
-SDRAM of any size is required.
+A MiSTer core for Konami's GV arcade system, built from the
+[PSX_MiSTer](https://github.com/MiSTer-devel/PSX_MiSTer) core by Robert Peip
+(FPGAzumSpass). The GV is a PlayStation-based arcade board: retail PSX silicon
+plus a small set of Konami devices on the EXP1 expansion bus. This core's
+first (and currently only tested) title is **Simpsons Bowling (GQ829 UAA)**,
+which boots, passes its security check, and plays on real hardware.
 
-## Features
-* Savestates
-* Option for core pause when OSD is open
-* Optional manual Memory Card file loading (.MCD)
-* CUE+BIN and CHD format support
-* Multiple Disc Game support with automatic Lid open/close toggle
-* Fast Boot (Skips BIOS)
-* Dithering On/Off Toggle
-* Bob or Weave Deinterlacing
-* Texture Filtering
-* 24 Bit rendering
-* Widescreen modes
-* Screen rotation by 180°
-* 8 Mbyte mode(from dev units, mostly for homebrew) 
-* Inputs: DualShock, Digital, Analog, Mouse, NeGcon, Wheel, Justifier and Guncon support.
-* Native Input support through SNAC
-* Old GPU (CXD8514Q)
+> Naming note: "Baby Phoenix / GV System" is frequently confused with
+> Konami's later System 573 (ATAPI CD, security carts, Bemani). They are
+> different boards. This core is GV: SCSI CD-ROM, parallel flash, and a
+> 93C46-class EEPROM. The authoritative hardware reference is MAME's
+> `konamigv.cpp`, not `ksys573.cpp`.
 
-## Bios
-Rename your playstation bios file (e.g. `scph-1001.bin`/`ps-22a.bin` ) and place it in the `./games/PSX/` folder.
+## What this board is
 
 ```
-boot.rom  => US BIOS
-boot1.rom => JP BIOS
-boot2.rom => EU BIOS
+ ┌──────────────────────────────────────────────────────────────┐
+ │  PlayStation base (unmodified PSX_MiSTer datapath)           │
+ │  R3000A CPU · GTE · GPU (VRAM in DDR3) · SPU · DMA · IRQ     │
+ │  2 MB main RAM (SDRAM) · 512 KB Konami BIOS (999A01.7E)      │
+ └──────────────┬───────────────────────────────────────────────┘
+                │ EXP1 bus @ 0x1F000000 (rtl/konami573.vhd)
+ ┌──────────────┴───────────────────────────────────────────────┐
+ │  0x1F000000  NCR 53CF96 SCSI (register-level model)          │
+ │              disc data via HPS sd_* mount → DMA channel 5    │
+ │              completion interrupt on IRQ10                   │
+ │  0x1F100000  JAMMA P1/P2 inputs                              │
+ │  0x1F180080  128-byte EEPROM window (holds the security code)│
+ │  0x1F680080  4×2 MB flash (interleaved, served from DDR3)    │
+ │  0x1F6800C0  µPD4701-class trackball counters                │
+ │  0x1F780000  watchdog (no-op)                                │
+ └──────────────────────────────────────────────────────────────┘
 ```
 
-You can also place a cd_bios.rom in the same directory as the CD or 1 directory above, to have it uses together with that CD. This can be used for games that depend on a special BIOS beyond usual US,EU,JP.
+The 573-numbered file names are historical (the project began under the
+573 misnomer); the hardware modeled is GV.
 
-If you get a black screen with "ED" overlay in upper left corner, either your BIOS files are corrupt or missing or you have no SDRAM module installed.
+Behavioral ground truth is the Arcade1Up `duckstation-sb` fork's
+`src/core/konami.cpp` (~530 lines) — the shipping emulator for this exact
+game — cross-checked against MAME's `konamigv.cpp`. Several hard-won
+bring-up bugs came down to matching that reference's exact bus semantics;
+see `docs/BRINGUP_NOTES.md`.
 
-## Region
+## Status — honest accounting
 
-Region settings (e.g. Clock, BIOS, CD check) are selected automatically when loading a CD. You can force a different Region in OSD.
+Boots and plays Simpsons Bowling on a DE10-nano-class board (HDMI + VGA,
+both timing corners met on the shipping build).
 
-## Memory Card
+| Component | State | Notes |
+|---|---|---|
+| SCSI 53CF96 register model | ✅ tested on hw | full boot handshake, READ(10), triple-read patterns |
+| Disc→RAM path (DMA ch5, HPS sd mount) | ✅ tested on hw | 2048 B flat sectors; out-of-range reads complete gracefully |
+| IRQ10 (SCSI interrupt) | ✅ measured on hw | delivery & CPU-ack counted 1:1 |
+| 4×2 MB flash from DDR3 | ✅ tested on hw | read-wait design; 16-bit address-register writes reassembled |
+| EEPROM window + save mount | ✅ tested on hw | auto-load on mount, dirty write-back, security check passes |
+| EXP1 sub-word semantics | ✅ tested on hw | byte/16/32-bit lanes match konami.cpp exactly; MEMCTRL bus-width reconfig ignored (as the reference does) |
+| JAMMA inputs (pad→P1 map) | ✅ tested on hw | start/buttons play the game |
+| Trackball | 🏗️ functional, feel WIP | mouse-driven; per-packet edge fix + OSD speed divider (1x…1/8) |
+| On-chip telemetry | ✅ kept aboard | access-ring/IRQ counters emitted via disc-fd marker channel |
+| Other GV titles (8 more) | 📋 untested | same device set; expected close |
+| Dead Eye light gun (GUNX/GUNY) | ❌ not implemented | only GV title needing it |
+| Tokimeki heartbeat/printer I/O | ❌ not implemented | specialty hardware |
+| GV-only trim (remove PSX CD/SIO/memcard/savestates) | 📋 planned | frees ~timing/power headroom; PSX cd_top already removed |
 
-Games that are in their own folder will create it's own memory card in media/fat/saves/psx as <folder name>.sav 
+Utilization is ~98% ALM — timing closes but is placement-sensitive;
+clean full compiles only (no incremental).
 
-One card can be mounted for each controller slot. Cards are in raw .mcd format. An empty formatted .mcd file is available for [download here](https://github.com/MiSTer-devel/PSX_MiSTer/raw/main/memcard/empty.mcd).
+## Running it
 
-You need to save them either manually in the OSD or turn on autosave. Saving or loading a card will pause the core for a short time.
+You must supply your own dumps (none are included or linked here):
+the GV BIOS `999a01.7e`, the four 2 MB flash dumps, a 128-byte EEPROM
+image, and a Mode-1/2048 disc image of your disc.
 
-## CUE+BIN and CHD files
+1. Interleave the four flash dumps into the single image the core loads:
+   `python3 tools/interleave_flash.py flash0 flash1 flash2 flash3 flash_573_simpbowl.bin`
+2. On the MiSTer SD: core `.rbf` at `/media/fat/`, BIOS as the PSX core's
+   `boot.rom`, flash image + EEPROM under `/media/fat/games/PSX/573/`,
+   disc image anywhere reachable.
+3. Launch via the MGL in `mgl/` (mounts EEPROM, flash, and disc in one
+   shot). OSD: `Load 573 Flash` (F2), `Mount 573 Disc` (S4),
+   `573 EEPROM Save` (S0), `Trackball Speed`.
 
-For proper operation, CUE/BIN and CHD game files should be placed in separate folders, with one folder per game. This allows the core to automatically create a dedicated virtual memory card for each game, preventing save data from being shared between different titles.
+## Building / testing
 
-Additionally, when a new game is selected, the core automatically resets itself, ensuring the game starts correctly without requiring a manual restart.
+Synthesis: Quartus Prime Lite **17.0.2**, Cyclone V. Always run clean
+full compiles (`quartus_sh --flow compile PSX` after wiping
+`db/ incremental_db/ output_files/`) — at this utilization, incremental
+builds lie about timing.
 
-## Multiple Disc Games
-
-To swap discs while the game is running, all disc files for the game must be placed in the same folder. When a disc change is required, the core will automatically simulate opening and closing the disc lid. Example folder structure of a multi-disc game:
+Simulation (NVC ≥ 1.21, VHDL-2008): the benches in `sim_gv/` drive the
+real `memorymux.vhd` + `konami573.vhd` end to end — including the exact
+security-check access under the game's 16-bit EXP1 bus configuration:
 
 ```
-/media/fat/games/PSX/Final Fantasy VII (USA)/Final Fantasy VII (USA) (Disc 1).chd
-/media/fat/games/PSX/Final Fantasy VII (USA)/Final Fantasy VII (USA) (Disc 2).chd
-/media/fat/games/PSX/Final Fantasy VII (USA)/Final Fantasy VII (USA) (Disc 3).chd
+cd sim_gv
+nvc --std=2008 --work=mem -a --relaxed RamMLAB_stub.vhd ../rtl/SyncFifoFallThroughMLAB.vhd
+nvc --std=2008 -L. --work=work_nvc -a --relaxed dpram_dif_stub.vhd ../rtl/konami573.vhd ../rtl/memorymux.vhd tb_memmux.vhd
+nvc --std=2008 -L. --work=work_nvc -e tb_memmux -r tb_memmux          # 34 checks
+nvc --std=2008 -L. --work=work_nvc -a --relaxed tb_konami573_boot.vhd
+nvc --std=2008 -L. --work=work_nvc -e tb_konami573_boot -r tb_konami573_boot --stop-time=2ms   # 26 checks
+nvc --std=2008 -L. --work=work_nvc -a --relaxed tb_flash.vhd
+nvc --std=2008 -L. --work=work_nvc -e tb_flash -gDDR3_LAT=20 -r tb_flash   # 0 stale expected
 ```
 
-## Video output
+## License
 
-Core can output through HDMI and Analog out.
+GPL-2.0, matching PSX_MiSTer and the MiSTer framework.
 
-HDMI also offers a debugging framebuffer mode with support of full VRAM as 1024x512 pixel image(debug only)
-
-Analog out from Direct Video is full 24Bit Color, but from Analog Board will only deliver 18 Bits of color.
-You can activate the 24 Bit dithering option to remove color banding in FMVs without decreasing the image quality in 16 bit color ingame.
-Do not use with HDMI or you get artifacts!
-
-Fixed Hblank as well as Fixed Vblank can help delivering correct aspect rations and keeping the screen in sync with e.g. shaking animations.
-Both also offer crop options for games that depend on CRT viewports to hide artifacts at the edge of the image.
-
-Sync 480i for HDMI will make 480i content run with 240p timings, making it easier for HDMI devices to keep the sync when switching between both modes in games. 
-Do not use with VGA/Analog out or you get artifacts!
-
-## Libcrypt
-
-Some games are secured with Libcrypt and will not work if it's not circumvented.
-
-You can provide a .sbi file to do that.
-If there is a .sbi file next to a .cue with the same name, it is loaded automatically when mounting the CD image.
-
-## Unsafe options
-
-The core offers various options to improve gameplay for some games, but those options cannot be considered stable through all games.
-If you use one or more of these options, the core will warn you every time you start a game.
-
-- 480i to 480p hack: 
-Allows to render some games with full 480p resolution, removing interlacing artifacts. Only works for some full 3D 480i titles.
-
-- Turbo: 
-Increases CPU, DMA, Memory and GTE performance by ~10%(Low), ~20%(Medium) or 50%(High). Cheats cannot be used while Turbo is on and are disabled automatically.
-
-- Pause when CD slow: 
-CD data must be returned in a fixed time frame, otherwise the core will pause until the data has arrived. Disabling this will remove these pauses, but also risk that the game hangs up due to CD data being late.
-
-- PAL 60Hz Hack:
-Runs PAL games with 60Hz. PAL Games will often run faster with this hack on. Screen height is limited to 256 lines in this mode, so some games might be cropped.
-
-- CD Fast Seek:
-CD will seek the next sector in the minimal possible time. Decreases loading time of games, but some games depend on the long loading times and will crash.
-
-- CD Speed:
-Allows to run the CD drive with fixed higher speed to decrease loading times, but some games depend on the long loading times and will crash.
-CD will automatically speed down to original speed for FMVs or CD audio playback and back to increased speed in loading areas.
-The higher speed rates are more unstable and require proper storage to be usable with bin/cue files reaching higher performance than chd.
-
-- Limit Max CD Speed:
-Will hold back any new CD data until the game has processed the last data. 
-Mostly useful to prevent CD data overrun when using higher speed modes, leading to overall faster loading times due to less read retries.
-
-- RAM:
-8 Mbyte option from development consoles. Only use for homebrew that requires it, otherwise there is a high chance of crashing games.
-
-## Error messages
-
-If there is a recognized problem, an overlay is displayed, showing which error has occured.
-You can hide these messages with an OSD option, by default they are on.
-
-List of Errors:
-- E2     - CPU exception(only relevant if game shows issues)
-- E3..E6 - GPU hangs (e.g. corrupt display list)
-- E7     - CPU2VRAM with mask-AND enabled
-- E8     - DMA chopping enabled
-- E9     - GPU FIFO overflow
-- EA     - SPU timeout
-- EB     - DMA and CPU interlock error 
-- EC     - DMA FIFO overflow
-- ED     - CPU Data/Bus request timeout -> will also appear if the BIOS is not found or corrupt or no SDRAM module is installed
-- EF     - BusWidth for SPU was set to 8 Bit (but should be 16 bit)
-
-## Debug Options
-
-The debug menu is intended for use by developers only. They don't really serve any purpose for regular users so it's best to leave them at their default setting as a lot of undesirable behavior could occur.
-
-## Pad Options
-The following pad types are emulated by the core and can be independently assigned to each port:
-- DualShock:
-  Switch Digital/Analog mode with mouse/touchpad click or L3+R3+Up/Down or mapable button 
-- Digital  
-  (ID 0x41) Ten button digital pad.
-- Analog  
-  (ID 0x73) Twinstick pad.  
-- Mouse  
-  (ID 0x12) Two button mouse.
-- Off  
-  Pad unplugged from port.
-- GunCon  
-  (ID 0x62) GunCon compatible lightgun.
-- Justifier  
-- NeGcon  
-  (ID 0x23) NeGcon compatible racing pad.  
-  Primarily developed for dual analog stick usage with the following mapping (genuine NeGcons  
-   may work if usb adapters map steering to Left Analog and I/II to Right Analog):
-   - Steering -> Left Analog (you can also use a paddle controller for this axis)
-   - Circle -> Circle
-   - Triangle -> Triangle
-   - I -> Right Analog Up, Cross (100% pressed), R2 (100% pressed)
-   - II -> Right Analog Down, Rectangle (100% pressed), L2 (100% pressed)
-   - L -> L1 (100% pressed)
-   - R -> R1
-   
-SNAC can be selected for each port and will support gamepads and memory cards on the corresponding slot.
-When SNAC is enabled for a slot, the emulated gamepad/memory for this slot is disconnected.
-
-## Controller mapping reference
-NeGcon based controllers
-
-| DualShock (for reference) | NeGcon | Volume | Pachinko |
-|:-------------------------:|:------:|:------:|:--------:|
-| D-PAD                     | D-PAD  |        |          |
-| RX Axis                   | Twist  | Paddle | Handle   |
-| RY Axis                   | I      |        |          |
-| LX Axis                   | L1     |        |          |
-| LY Axis                   | II     |        |          |
-| O                         | A      | B      |          |
-| △                         | B      |        |          |
-| R1                        | R1     |        |          |
-| Start                     | Start  | A      | Button   |
-
-Lightgun
-  
-| DualShock (for reference) |   Guncon  | Justifier |
-|:-------------------------:|:---------:|:---------:|
-| O                         | Trigger   | Trigger   |
-| Start                     | A (Left)  | Start     |
-| X                         | B (Right) | Special   |
-  
-## Status
-
-Many games working
-
---
-
-CPU    : 90%
-- exception for read in invalid instruction and data area missing
-
-GPU    : 90%
-- mask bits not implemented for cpu2vram -> nothing yet found that uses it
-- vram2vram read/modify/write race condition when copying to same line
-
-IRQ    : 90%
-- irq_SIO missing because unused        
-
-PAD    : 90%
-- full configurable multitap missing
-
-Memctrl: register stubs only
-
-SIO    : register stubs only
-
-Timer  : 90%
-- accuracy for dotclock and gates timer not tested
-
-GTE    : 90%
-- CPU <-> GTE Transfer pipeline delay not fully correct
-
-MDEC   : 90%
-- timing slightly too fast (4996/5376)
- 
-CD     : 90%
-- accurate CD access model for correct seek times should be added
-- drive and controller logic should be seperated
+Credits: Robert Peip (FPGAzumSpass) for the extraordinary PSX core this
+stands on; the MAME team's `konamigv.cpp` for authoritative hardware
+facts; the Arcade1Up `duckstation-sb` fork's `konami.cpp` as the
+behavioral reference; psx-spx for PSX platform documentation.

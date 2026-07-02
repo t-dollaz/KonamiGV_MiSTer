@@ -36,3 +36,9 @@ c5_pin_model_dump.txt
 *~
 *.xml
 *.cdf
+
+# simulation work libraries
+sim_gv/work*/
+sim_gv/mem/
+rtl/work_nvc/
+work/
