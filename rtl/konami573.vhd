@@ -24,6 +24,11 @@ entity konami573 is
 
       -- EXP1 bus (8-bit, byte-stepped)
       bus_addr      : in  unsigned(22 downto 0);
+      bus_bstep     : in  std_logic_vector(1 downto 0) := "00";  -- byte-of-CPU-access (konami.cpp lane semantics; from memorymux ext_byteStep)
+      bus_a10       : in  std_logic_vector(1 downto 0) := "00";  -- CPU access address bits 1:0, stable from access start
+      irq10_rise_cnt : in unsigned(7 downto 0) := (others => '0');  -- IRQ10 latched into I_STAT (from psx_top counter)
+      irq10_fall_cnt : in unsigned(7 downto 0) := (others => '0');  -- IRQ10 acked by CPU
+      tball_speed   : in  std_logic_vector(1 downto 0) := "00";     -- OSD trackball sensitivity: delta >> speed (1x,1/2,1/4,1/8)
       bus_dataWrite : in  std_logic_vector(7 downto 0);
       bus_read      : in  std_logic;
       bus_write     : in  std_logic;
@@ -99,12 +104,14 @@ architecture arch of konami573 is
    constant REG_FIFOSTATE : integer := 7;
 
    signal FlashAddress : unsigned(23 downto 0) := (others => '0');
+   signal fl_wr_lo     : unsigned(7 downto 0) := (others => '0');  -- low byte latch for 16-bit flash-address writes
 
    -- CurrentButtons = buttons XOR 0xFFFFFFFF (konami.cpp KonamiButtonsSet)
    signal CurrentButtons : unsigned(31 downto 0);
 
    -- EEPROM (128 bytes) in M10K block RAM. Port A = EXP1 (byte); port B = HPS save mount (16-bit).
-   signal ee_addr : std_logic_vector(6 downto 0);
+   signal ee_addr   : std_logic_vector(6 downto 0);
+   signal ee_addr_q : std_logic_vector(6 downto 0) := (others => '1');  -- dpram-registered-address tracker (EEPROM read stall)
    signal ee_wren : std_logic;
    signal ee_q    : std_logic_vector(7 downto 0);
    signal eep_addr_b : std_logic_vector(5 downto 0);
@@ -117,6 +124,7 @@ architecture arch of konami573 is
    signal eeprom_dirty : std_logic := '0';
    signal loadLatched  : std_logic := '0';
    signal saveLatched  : std_logic := '0';
+   signal loadedOnce   : std_logic := '0';  -- auto-load guard: one load per reset while mounted
 
    signal region  : integer range 0 to 127;
    signal scsiReg : integer range 0 to 15;
@@ -134,6 +142,7 @@ architecture arch of konami573 is
    -- Disc-fetch FSM, modeled on rtl/memcard.vhd LOAD path.
    type tDiscState is (D_IDLE, D_REQ, D_WAITSTART, D_WAITDONE);
    signal discState   : tDiscState := D_IDLE;
+   signal fetch_tout  : unsigned(21 downto 0) := (others => '0');  -- ~124ms @33.87MHz HPS-silence timeout
    signal blkIdx      : std_logic := '0';            -- which 1024B half of the 2048B sector
    signal fetchStart  : std_logic := '0';            -- latched request to fetch a sector
    signal bufferValid : std_logic := '0';            -- current sector is in the buffer
@@ -158,9 +167,54 @@ architecture arch of konami573 is
    -- Combine -> full PC. All LBAs < ISO's ~24395 sectors. Gated to D_IDLE so it never disturbs a
    -- real disc read (on a working boot it simply defers).
    signal dbg_pc_cnt   : unsigned(DBG_PC_CNT_BITS-1 downto 0) := (others => '0');
-   signal dbg_pc_phase : unsigned(1 downto 0) := (others => '0');
+   signal dbg_pc_phase : unsigned(2 downto 0) := (others => '0');  -- cycles 0..6 over the 7 milestone bands
    signal dbg_pc_latch : unsigned(31 downto 0) := (others => '0');  -- PC snapshot (frozen at phase 0)
-   signal scsi_seen    : std_logic := '0';  -- latched once the boot first touches SCSI (region 0) -> silences the PC probe
+   signal scsi_seen    : std_logic := '0';  -- latched once the boot first touches SCSI (region 0)
+
+   -- ===== MILESTONE PROBE (replaces the unreliable PC-reconstruction probe) =====
+   -- Latch how far the boot progresses through the known DuckStation sequence, then emit the
+   -- HIGHEST milestone reached over the disc-read channel (fd pos = ScsiSectorLba*2048):
+   --   level 1 P1 read   (region 0x10) -> lba 0x1000 -> fd ~8MB   (reached pre-SCSI input poll)
+   --   level 2 EEPROM    (region 0x18) -> lba 0x2000 -> fd ~16MB  (reached the EEPROM-W 0x20 pre-SCSI step)
+   --   level 3 SCSI      (region 0x00) -> lba 0x3000 -> fd ~24MB  (entered the 53CF96 handshake)
+   --   level 4 READ(10)  (CDB 0x28)    -> lba 0x4000 -> fd ~32MB  (issued the real disc command)
+   --   fd == 0 -> never reached even P1 (stuck in early POST / core code).
+   -- All lbas < the ISO's 24395 sectors. Fires only when the disc FSM is idle + no real read
+   -- pending (discState=D_IDLE, dmaArmed=0, fetchStart=0), so it never corrupts a real READ(10):
+   -- READ(10) arms dmaArmed in one cycle (gates the probe off) and its ScsiSectorLba assignment
+   -- is later in the process (wins any same-cycle race).
+   signal ms_p1        : std_logic := '0';  -- reached P1 input read    (region 0x10)
+   signal ms_eeprom    : std_logic := '0';  -- reached EEPROM access    (region 0x18)
+   signal ms_tball     : std_logic := '0';  -- reached trackball        (region 0x68, offset 0xC0-0xCF)
+   signal ms_flash     : std_logic := '0';  -- reached flash window     (region 0x68, offset 0x80-0x8F)
+   signal ms_read10    : std_logic := '0';  -- reached SCSI READ(10)    (CDB 0x28 decoded)
+   -- Last-valid-PC (derail origin) snapshot: frozen when the PC first leaves valid range
+   signal pc_last_valid : unsigned(31 downto 0) := (others => '0'); -- most recent in-range PC
+   signal bad_pc        : unsigned(31 downto 0) := (others => '0'); -- first out-of-range PC (wild target)
+   signal prev_valid    : std_logic := '0';
+   signal captured      : std_logic := '0';                         -- derail captured (dbg_pc_latch = origin PC)
+
+   -- ===== ACCESS-RING PROBE (#8): capture the LAST 16 EXP1 accesses before the game goes
+   -- QUIET (no EXP1 access for ~0.5s = halted at the error screen), then emit each entry
+   -- forever via marker LBAs: lba = "01" & idx(3:0) & rw & region(6:0) & offset(7:0) & bstep(1:0).
+   -- The disc-fetch timeout serves the far-out marker reads (stale buffer) so the fd parks at
+   -- lba*2048 long enough to poll. Entry idx=15 is replaced by the total CDB(0x42) count.
+   -- entry (v2, value-carrying): type(2) [00=SCSI 01=EEPROM 10=flash 11=other] & reg/word idx(6)
+   --                             & rw(1) & data(8) & bstep0(1)  = 18 bits
+   type tRing is array(0 to 15) of std_logic_vector(17 downto 0);
+   signal ring        : tRing := (others => (others => '0'));
+   signal ring_wr     : unsigned(3 downto 0) := (others => '0');
+   signal mouse_event_q : std_logic := '0';                        -- ps2_mouse toggle tracker (count each packet once)
+   signal pend_valid  : std_logic := '0';                          -- 1-cycle-delayed capture (reads: grab served byte)
+   signal pend_meta   : std_logic_vector(9 downto 0) := (others => '0');  -- type2 & idx6 & rw1 & bstep0
+   signal pend_wdata  : std_logic_vector(7 downto 0) := (others => '0');
+   signal ring_frozen : std_logic := '0';
+   signal quiet_cnt   : unsigned(23 downto 0) := (others => '0');   -- ~0.5s @33.87MHz
+   signal emit_idx    : unsigned(4 downto 0) := (others => '0');  -- 0-15 ring/cdb, 16 = IRQ10 diag, then wrap
+   signal cdb_count   : unsigned(15 downto 0) := (others => '0');   -- total command-0x42 latches
+   signal ring_seen   : std_logic := '0';                           -- any EXP1 access at all yet
+   signal last_region : std_logic_vector(6 downto 0) := (others => '0');  -- region of the newest captured access
+   signal diag_wait   : unsigned(28 downto 0) := (others => '0');   -- ~8s arm delay for the not-frozen diag heartbeat
 
 begin
 
@@ -182,7 +236,32 @@ begin
    p1val(0)  <= '0' when (CurrentButtons(7) = '1') else '1';  -- LEFT  (0x0080)
 
    -- EEPROM block RAM (M10K). Port A = EXP1 bus (byte); Port B = HPS save mount (16-bit word).
-   ee_addr <= std_logic_vector(bus_addr(6 downto 0));
+   -- konami.cpp sub-word semantics (KonamiEepromRead, konami.cpp:395-406 + bus.cpp applies NO
+   -- byte-lane fixup to EXP1 device reads): the handler returns the full 16-bit word for ANY
+   -- access size/offset, so a BYTE read at an ODD offset yields the word's LOW byte and a 32-bit
+   -- read yields the word ZERO-EXTENDED. Replicate by addressing the byte lane with the
+   -- CPU-access byte-step (bus_bstep), NOT the address bit 0: word index = bus_addr(6:1),
+   -- byte-within-word = bstep(0). Writes keep address-based lanes (write path byte-steps are
+   -- mask-seeded and equal the address lanes for the 16-bit stores the game uses).
+   -- Read address composed ONLY from early-stable signals (bus_addr(6:2) is stable from
+   -- access start; bit1 of the bus address arrives late in the lane arithmetic, so use the
+   -- raw access address bit via bus_a10 instead): word = bus_addr(6:2) & a10(1), lane = bstep(0).
+   -- No stall needed -> no stall-restart hazard (ring probe #12).
+   -- Read-form is the DEFAULT (so the dpram's registered address is already settled a cycle
+   -- before the read strobe); the write-form (true byte address) applies only during the write
+   -- strobe itself, which is fine because dpram writes take address+data+wren on the same edge.
+   ee_addr <= std_logic_vector(bus_addr(6 downto 0)) when bus_write = '1'
+              else std_logic_vector(bus_addr(6 downto 2)) & bus_a10(1) & bus_bstep(0);
+   -- registered copy: ee_addr_q == ee_addr means the dpram's registered address (and thus q_a)
+   -- reflects the live bus address; used by the bus_exp1_wait EEPROM stall term.
+   process (clk1x)
+   begin
+      if rising_edge(clk1x) then
+         if ce = '1' then
+            ee_addr_q <= ee_addr;
+         end if;
+      end if;
+   end process;
    ee_wren <= '1' when (ce = '1' and bus_write = '1' and region = 16#18#) else '0';
    -- Port B tracks the sd_buff word address; only the first 64 words (128 B) are the EEPROM.
    eep_addr_b <= eeprom_addr(5 downto 0);
@@ -201,7 +280,7 @@ begin
    isectorBuffer : entity work.dpram_dif
       generic map (addr_width_a => 9, data_width_a => 32, addr_width_b => 10, data_width_b => 16)
       port map (
-         clock_a => clk1x, address_a => buf_addr_a, q_a => buf_q_a,           -- port A: DMA drain (read-only)
+         clock_a => clk1x, address_a => buf_addr_a, data_a => (others => '0'), q_a => buf_q_a,  -- port A: read-only
          clock_b => clk1x, address_b => buf_addr_b, data_b => disc_data, wren_b => buf_wren_b, q_b => open
       );
 
@@ -232,9 +311,16 @@ begin
    -- so the loader's tight read loop got STALE flash data. Now a flash-data-port read STALLS
    -- (bus_exp1_wait) until the DDR3 FSM publishes the word for THIS FlashAddress (flash_rdaddr ==
    -- FlashAddress). Level-based compare = clk1x/clk2x-CDC-safe (no fragile ready pulse).
+   -- (EEPROM stall REMOVED, build #13: since the sub-word semantics fix, the EEPROM dpram
+   -- address is bus_addr(6:1) & bstep(0) -- the word index is stable from access start and
+   -- the byte-step settles between strobes, so q_a is always valid by the capture edge with
+   -- no stall. The stall had become a hardware hazard: ring probe #12 showed the security
+   -- decision's EEPROM word-2 read arriving as TWO bstep0=0 strobes (suspected stall-induced
+   -- access restart -> assembled 0x0808 instead of 0x0F08 -> wrong game ID).
    bus_exp1_wait <= '1' when (bus_read = '1' and region = 16#68# and
                               bus_addr(7 downto 4) = "1000" and bus_addr(3 downto 1) = "000" and
-                              flash_rdaddr /= std_logic_vector(FlashAddress)) else '0';
+                              flash_rdaddr /= std_logic_vector(FlashAddress)) else
+                    '0';
 
    -- EEPROM save-mount FSM: load the 128 B dump on mount, write it back when dirty. The sd_*
    -- rd/wr handshake mirrors memcard.vhd (assert until ack; the buffer streams during the ack
@@ -250,16 +336,25 @@ begin
             eeprom_dirty <= '0';
             loadLatched  <= '0';
             saveLatched  <= '0';
+            loadedOnce   <= '0';
          else
             if eeprom_load = '1' then loadLatched <= '1'; end if;
             if eeprom_save = '1' then saveLatched <= '1'; end if;
 
             case eepState is
                when EE_IDLE =>
-                  if (loadLatched = '1' and eeprom_mounted = '1') then
+                  -- loadedOnce: the MGL mounts S0 while the core is still held in reset by the
+                  -- flash ioctl download (reset_or includes flash_download), so the 1-cycle
+                  -- eeprom_load pulse is swallowed and loadLatched stays clear -> the game would
+                  -- read an all-zeros EEPROM (checksum 0==0 passes, security code fails).
+                  -- konami.cpp loads the EEPROM file before emulation starts (KonamiInit,
+                  -- konami.cpp:114-126); mirror that by auto-loading once whenever a mount is
+                  -- present and we haven't loaded since reset.
+                  if ((loadLatched = '1' or loadedOnce = '0') and eeprom_mounted = '1') then
                      eeprom_rd   <= '1';
                      eep_loading <= '1';
                      loadLatched <= '0';
+                     loadedOnce  <= '1';
                      eepState    <= EE_LOAD_WSTART;
                   elsif (saveLatched = '1') then
                      saveLatched <= '0';
@@ -311,6 +406,8 @@ begin
       variable v_tbreset  : std_logic;
       variable v_tx       : signed(12 downto 0);
       variable v_ty       : signed(12 downto 0);
+      variable v_pcphys   : unsigned(28 downto 0);
+      variable v_pcvalid  : std_logic;
    begin
       if rising_edge(clk1x) then
 
@@ -334,36 +431,146 @@ begin
             dbg_pc_cnt   <= (others => '0');
             dbg_pc_phase <= (others => '0');
             scsi_seen    <= '0';
+            ms_p1        <= '0';
+            ms_eeprom    <= '0';
+            ms_tball     <= '0';
+            ms_flash     <= '0';
+            ms_read10    <= '0';
+            captured     <= '0';
+            prev_valid   <= '0';
+            ring_wr      <= (others => '0');
+            ring_frozen  <= '0';
+            quiet_cnt    <= (others => '0');
+            emit_idx     <= (others => '0');
+            cdb_count    <= (others => '0');
+            ring_seen    <= '0';
+            last_region  <= (others => '0');
+            diag_wait    <= (others => '0');
+            pend_valid   <= '0';
             TrackballX   <= (others => '0');
             TrackballY   <= (others => '0');
 
          elsif ce = '1' then
 
             ------------------------------------------------------------------
-            -- DEBUG PROBE: emit the CPU program counter over the disc-read channel.
-            -- Free-running counter; on wrap, fire one disc read whose LBA encodes a
-            -- slice of cpu_pc (3 phases). Gated to D_IDLE + no pending real read, so
-            -- it never disturbs an actual disc transfer. ALSO gated on scsi_seen='0':
-            -- once the boot reaches the SCSI registers (region 0) it is past the early
-            -- flash loop, so the probe goes silent and cannot collide with the boot's
-            -- real disc reads. Probe stays live only while stuck BEFORE SCSI (diagnostic).
+            -- MILESTONE PROBE (#22): emit highest boot milestone over disc channel.
+            -- LBA encoding (fd = LBA*2048):
+            --   0x0001 → fd ~2KB  = alive, no EXP1 milestone yet
+            --   0x1000 → fd ~8MB  = P1 input read    (region 0x10)
+            --   0x2000 → fd ~16MB = EEPROM access     (region 0x18)
+            --   0x3000 → fd ~24MB = flash/trackball   (region 0x68)
+            --   0x4000 → fd ~32MB = SCSI region read  (region 0x00)
+            --   0x5000 → fd ~40MB = SCSI READ(10)     (CDB 0x28)
+            -- Fires every 2^DBG_PC_CNT_BITS cycles when disc FSM is idle.
             ------------------------------------------------------------------
-            if ((bus_read = '1' or bus_write = '1') and region = 16#00#) then
-               scsi_seen <= '1';
-            end if;
             dbg_pc_cnt <= dbg_pc_cnt + 1;
-            if (scsi_seen = '0' and dbg_pc_cnt = 0 and discState = D_IDLE and dmaArmed = '0' and fetchStart = '0') then
-               -- SNAPSHOT: freeze the whole PC at phase 0, then emit all 3 slices from the latch,
-               -- so the 3 disc reads describe ONE PC (the v1 bug sampled 3 different-time PCs).
-               case dbg_pc_phase is
-                  when "00"   => dbg_pc_latch <= cpu_pc;
-                                 ScsiSectorLba <= resize(cpu_pc(12 downto 2), 32);                              -- =snapshot(12:2)
-                  when "01"   => ScsiSectorLba <= to_unsigned(16#0800#, 32) + resize(dbg_pc_latch(23 downto 13), 32);
-                  when others => ScsiSectorLba <= to_unsigned(16#1000#, 32) + resize(dbg_pc_latch(31 downto 24), 32);
-               end case;
-               fetchStart  <= '1';
-               bufferValid <= '0';
-               if (dbg_pc_phase = 2) then dbg_pc_phase <= "00"; else dbg_pc_phase <= dbg_pc_phase + 1; end if;
+            -- Probe disabled once game issues real READ(10): avoid corrupting bufferValid for game DMA.
+            if (dbg_pc_cnt = 0 and discState = D_IDLE and dmaArmed = '0' and fetchStart = '0' and ms_read10 = '0') then
+               fetchStart <= '1'; bufferValid <= '0';
+               if scsi_seen = '1' then
+                  ScsiSectorLba <= to_unsigned(16#4000#,32);
+               elsif ms_tball = '1' or ms_flash = '1' then
+                  ScsiSectorLba <= to_unsigned(16#3000#,32);
+               elsif ms_eeprom = '1' then
+                  ScsiSectorLba <= to_unsigned(16#2000#,32);
+               elsif ms_p1 = '1' then
+                  ScsiSectorLba <= to_unsigned(16#1000#,32);
+               else
+                  ScsiSectorLba <= to_unsigned(16#0001#,32);
+               end if;
+            end if;
+
+            ------------------------------------------------------------------
+            -- ACCESS-RING PROBE (#8): capture EXP1 accesses; freeze on ~0.5s of
+            -- EXP1 silence after the game reached disc loading (= halted at the
+            -- error screen); then emit the ring via marker LBAs forever. The
+            -- fetch timeout completes the far-out marker reads with stale data.
+            ------------------------------------------------------------------
+            -- Filter watchdog (0x78), P1/P2 (0x10), AND the trackball window (0x68/0xC0-0xCF)
+            -- out of capture and quiet detection: the halted game's input loop polls the
+            -- trackball every ~100ms forever (probe #10 diag: region 0x68 spam, ring_wr cycling),
+            -- which floods the ring and prevents the freeze. Flash (0x68/0x80-0x8F) stays visible.
+            -- Stage 1: on a capturable access, latch metadata (+write data); stage 2: commit to
+            -- the ring one cycle later so READ entries can grab the byte our core actually
+            -- served (bus_dataRead is registered by then and holds until the next access).
+            -- Split filters (#15): quiet-freeze keyed ONLY on meaningful traffic (SCSI/EEPROM/
+            -- flash) going silent; the ring CAPTURES everything except the watchdog, so the
+            -- frozen ring also shows the P1/trackball VALUES the game read at the decision.
+            pend_valid <= '0';
+            if ((bus_read = '1' or bus_write = '1') and region /= 16#78#) then
+               if (region /= 16#10# and not (region = 16#68# and bus_addr(7 downto 4) = "1100")) then
+                  quiet_cnt <= (others => '0');
+                  ring_seen <= '1';
+               end if;
+               last_region <= std_logic_vector(bus_addr(22 downto 16));
+               if ring_frozen = '0' then
+                  pend_valid <= '1';
+                  pend_wdata <= bus_dataWrite;
+                  if region = 16#00# then
+                     pend_meta <= "00" & "00" & std_logic_vector(bus_addr(4 downto 1)) & bus_write & bus_bstep(0);
+                  elsif region = 16#18# then
+                     pend_meta <= "01" & std_logic_vector(bus_addr(6 downto 1)) & bus_write & bus_bstep(0);
+                  elsif region = 16#68# then
+                     -- idx6 bit5 = addr(6): 1 = trackball window (0xC0+), 0 = flash (0x80+)
+                     pend_meta <= "10" & bus_addr(6) & '0' & std_logic_vector(bus_addr(3 downto 0)) & bus_write & bus_bstep(0);
+                  else
+                     pend_meta <= "11" & std_logic_vector(bus_addr(5 downto 0)) & bus_write & bus_bstep(0);
+                  end if;
+               end if;
+            elsif (ms_read10 = '1' and ring_seen = '1' and ring_frozen = '0') then
+               quiet_cnt <= quiet_cnt + 1;
+               if quiet_cnt = (quiet_cnt'range => '1') then
+                  ring_frozen <= '1';
+               end if;
+            end if;
+
+            if pend_valid = '1' and ring_frozen = '0' then
+               -- entry = type2 & idx6 & rw1 & data8 & bstep0 (reads: data = byte just served)
+               if pend_meta(1) = '1' then   -- rw bit
+                  ring(to_integer(ring_wr)) <= pend_meta(9 downto 2) & pend_wdata &
+                                               pend_meta(1) & pend_meta(0);
+               else
+                  ring(to_integer(ring_wr)) <= pend_meta(9 downto 2) & bus_dataRead &
+                                               pend_meta(1) & pend_meta(0);
+               end if;
+               ring_wr <= ring_wr + 1;
+            end if;
+
+            if ms_read10 = '1' and diag_wait /= (diag_wait'range => '1') then
+               diag_wait <= diag_wait + 1;   -- saturating ~8s arm delay after disc loading begins
+            end if;
+
+            -- Emission: dmaArmed deliberately NOT required (probe #9 lesson: a stuck armed
+            -- transfer at the halt must not silence telemetry). fetchStart/discState guards
+            -- keep the HPS handshake itself consistent.
+            if (dbg_pc_cnt = 0 and discState = D_IDLE and fetchStart = '0') then
+               if ring_frozen = '1' then
+                  fetchStart  <= '1'; bufferValid <= '0';
+                  if emit_idx = 16 then
+                     -- IRQ10 delivery diag: "10" & rise(7:0) & fall(7:0) & "000000"
+                     ScsiSectorLba <= unsigned(std_logic_vector'(x"00" & "10" &
+                                               std_logic_vector(irq10_rise_cnt) &
+                                               std_logic_vector(irq10_fall_cnt) & "000000"));
+                     emit_idx <= (others => '0');
+                  else
+                     if emit_idx = 15 then
+                        ScsiSectorLba <= unsigned(std_logic_vector'(x"00" & "011111" & "00" &
+                                                  std_logic_vector(cdb_count)));
+                     else
+                        -- oldest-first: entry order = ring_wr + emit_idx (ring_wr points past newest)
+                        ScsiSectorLba <= unsigned(std_logic_vector'(x"00" & "01" & std_logic_vector(emit_idx(3 downto 0)) &
+                                                  ring(to_integer(ring_wr + emit_idx(3 downto 0)))));
+                     end if;
+                     emit_idx <= emit_idx + 1;
+                  end if;
+               elsif diag_wait = (diag_wait'range => '1') then
+                  -- not frozen long after disc loading: report WHO keeps resetting the quiet
+                  -- counter. lba = "10" & last_region(6:0) & ring_wr(3:0) & quiet_cnt(23:13)
+                  fetchStart  <= '1'; bufferValid <= '0';
+                  ScsiSectorLba <= unsigned(std_logic_vector'(x"00" & "10" & last_region &
+                                            std_logic_vector(ring_wr) &
+                                            std_logic_vector(quiet_cnt(23 downto 13))));
+               end if;
             end if;
 
             ------------------------------------------------------------------
@@ -373,6 +580,7 @@ begin
             if bus_read = '1' then
                case region is
                   when 16#00# =>                                   -- SCSI 0x000000-0x00001F
+                     scsi_seen    <= '1';
                      bus_dataRead <= ScsiRegs(scsiReg);
                      if scsiReg = REG_FIFO then
                         bus_dataRead <= (others => '0');
@@ -381,10 +589,13 @@ begin
                      end if;
 
                   when 16#10# =>                                   -- P1 0x100000 / P2 0x100004
+                     ms_p1 <= '1';
                      if bus_addr(2) = '1' then
                         bus_dataRead <= (others => '1');            -- P2 = 0xFF
                      else
-                        case bsel is
+                        -- lane by CPU-access byte-step, not address (konami.cpp returns the full
+                        -- Value for any size/offset; a byte read at ANY offset sees bits 0-7)
+                        case to_integer(unsigned(bus_bstep)) is
                            when 0      => bus_dataRead <= p1val(7  downto  0);
                            when 1      => bus_dataRead <= p1val(15 downto  8);
                            when 2      => bus_dataRead <= p1val(23 downto 16);
@@ -393,25 +604,34 @@ begin
                      end if;
 
                   when 16#18# =>                                   -- EEPROM 0x180080-0x1800FF
-                     bus_dataRead <= ee_q;
+                     ms_eeprom <= '1';
+                     if bus_bstep(1) = '1' then
+                        bus_dataRead <= (others => '0');           -- 32-bit read upper half: konami.cpp zero-extends the u16
+                     else
+                        bus_dataRead <= ee_q;
+                     end if;
 
                   when 16#68# =>                                   -- flash 0x6800{80..8F} / trackball 0x6800{C0..C9}
                      if bus_addr(7 downto 4) = "1100" then         -- 0xC0..0xCF trackball window
+                        ms_tball <= '1';
                         if bus_addr(3) = '0' then                  -- 0xC0..0xC7 data (axis in HIGH byte, low byte 0)
-                           if bus_addr(0) = '0' then
-                              bus_dataRead <= (others => '0');                                          -- low byte
-                           else
+                           -- konami.cpp positions the axis in bits 8-15 of the returned Value;
+                           -- lane by byte-step (bstep 1 = the axis byte; 0/2/3 = zero)
+                           if bus_bstep = "01" then
                               case to_integer(bus_addr(2 downto 1)) is
                                  when 0      => bus_dataRead <= std_logic_vector(TrackballX(7 downto 0));            -- C0 hi
                                  when 1      => bus_dataRead <= "0000" & std_logic_vector(TrackballX(11 downto 8));  -- C2 hi
                                  when 2      => bus_dataRead <= std_logic_vector(TrackballY(7 downto 0));            -- C4 hi
                                  when others => bus_dataRead <= "0000" & std_logic_vector(TrackballY(11 downto 8));  -- C6 hi
                               end case;
+                           else
+                              bus_dataRead <= (others => '0');     -- lanes 0/2/3: konami.cpp Value has zeros there
                            end if;
                         else                                       -- 0xC8 (konami.cpp default case) -> zero counters
                            v_tbreset := '1';
                         end if;
                      elsif bus_addr(7 downto 4) = "1000" then      -- 0x80..0x8F flash data port
+                        ms_flash <= '1';
                         if bus_addr(3 downto 1) = "000" then        -- offset 0: 16-bit interleaved word
                            if bus_addr(0) = '0' then
                               bus_dataRead <= flash_data(7 downto 0);    -- low byte  (Flash[Chip])
@@ -467,6 +687,7 @@ begin
                               when 16#03# =>
                                  v_intstate := x"04"; v_irq := '1';
                               when 16#42# =>
+                                 cdb_count <= cdb_count + 1;   -- probe telemetry: total commands latched
                                  if ScsiFifo(1) = x"00" or ScsiFifo(1) = x"48" or ScsiFifo(1) = x"4B" then
                                     v_intstate := x"06";
                                  else
@@ -484,6 +705,7 @@ begin
                                     when x"28" =>                  -- READ(10): latch LBA, arm sector fetch
                                        ScsiSectorLba <= unsigned(ScsiFifo(3)) & unsigned(ScsiFifo(4)) &
                                                         unsigned(ScsiFifo(5)) & unsigned(ScsiFifo(6));
+                                       ms_read10  <= '1';            -- MILESTONE: reached the real disc READ(10)
                                        ScsiIsRead <= '1';
                                        v_status := (v_status and x"F8") or x"01";
                                        dmaArmed    <= '1';
@@ -521,16 +743,39 @@ begin
                      ScsiRegs(REG_IRQSTATE) <= v_irqstate;
                      if v_irq = '1' then irq10_set <= '1'; end if;
 
-                  when 16#68# =>                                   -- flash address writes (0x82/0x84/0x86, 8-bit)
+                  when 16#68# =>                                   -- flash address writes (0x82/0x84/0x86)
+                     -- konami.cpp (KonamiFlashWrite, konami.cpp:369-391) gets ONE call with the
+                     -- full 16-bit Value: wr@2 FA=Val<<1 (reaches bit16), wr@4 |=Val<<8 (bit23),
+                     -- wr@6 |=Val<<15 (bit30). Our bus byte-steps 16-bit writes, so the high
+                     -- byte used to be DROPPED (odd offsets fell into "others=>null") -- any FA
+                     -- set with a nonzero high byte seeked the wrong flash address. Fix: apply
+                     -- the op on the even byte (konami.cpp byte-write behavior), then on the
+                     -- second byte-step (bstep=01) REAPPLY it with the reassembled 16-bit value
+                     -- {hi,lo}; algebra over the masks makes the double-apply equal konami.cpp's
+                     -- single 16-bit op for all three registers.
                      if bus_addr(7 downto 4) = "1000" then         -- flash window only (not trackball 0xC0+)
-                        case to_integer(bus_addr(3 downto 0)) is
-                           when 2 => FlashAddress <= shift_left(resize(unsigned(bus_dataWrite), 24), 1);
-                           when 4 => FlashAddress <= (FlashAddress and to_unsigned(16#FF00FF#, 24)) or
-                                                     shift_left(resize(unsigned(bus_dataWrite), 24), 8);
-                           when 6 => FlashAddress <= (FlashAddress and to_unsigned(16#00FFFF#, 24)) or
-                                                     shift_left(resize(unsigned(bus_dataWrite), 24), 15);
-                           when others => null;
-                        end case;
+                        -- NOTE: write-path byteStep is the lane within the 32-bit WORD (a 16-bit
+                        -- write @+2 arrives with bsteps 2,3), so pair even/odd bytes by bstep(0).
+                        if bus_bstep(0) = '0' then
+                           fl_wr_lo <= unsigned(bus_dataWrite);    -- low byte of a possible 16-bit access
+                           case to_integer(bus_addr(3 downto 0)) is
+                              when 2 => FlashAddress <= shift_left(resize(unsigned(bus_dataWrite), 24), 1);
+                              when 4 => FlashAddress <= (FlashAddress and to_unsigned(16#FF00FF#, 24)) or
+                                                        shift_left(resize(unsigned(bus_dataWrite), 24), 8);
+                              when 6 => FlashAddress <= (FlashAddress and to_unsigned(16#00FFFF#, 24)) or
+                                                        shift_left(resize(unsigned(bus_dataWrite), 24), 15);
+                              when others => null;
+                           end case;
+                        else                                       -- 2nd byte of a 16-bit write: reapply with {hi,lo}
+                           case to_integer(bus_addr(3 downto 0)) is
+                              when 3 => FlashAddress <= resize(shift_left(resize(unsigned(bus_dataWrite) & fl_wr_lo, 25), 1), 24);
+                              when 5 => FlashAddress <= (FlashAddress and to_unsigned(16#FF00FF#, 24)) or
+                                                        resize(shift_left(resize(unsigned(bus_dataWrite) & fl_wr_lo, 32), 8), 24);
+                              when 7 => FlashAddress <= (FlashAddress and to_unsigned(16#00FFFF#, 24)) or
+                                                        resize(shift_left(resize(unsigned(bus_dataWrite) & fl_wr_lo, 39), 15), 24);
+                              when others => null;
+                           end case;
+                        end if;
                      end if;
 
                   when others => null;
@@ -555,16 +800,28 @@ begin
                   end if;
 
                when D_REQ =>
-                  disc_lba  <= std_logic_vector(ScsiSectorLba(30 downto 0)) & blkIdx;  -- lba*2 + blkIdx
-                  disc_req  <= '1';
-                  discState <= D_WAITSTART;
+                  disc_lba   <= std_logic_vector(ScsiSectorLba(30 downto 0)) & blkIdx;  -- lba*2 + blkIdx
+                  disc_req   <= '1';
+                  fetch_tout <= (others => '0');
+                  discState  <= D_WAITSTART;
 
                when D_WAITSTART =>
+                  fetch_tout <= fetch_tout + 1;
                   if disc_ack = '1' then
                      discState <= D_WAITDONE;
+                  elsif fetch_tout = (fetch_tout'range => '1') then
+                     -- HPS never serviced this block (e.g. out-of-range LBA -> EOF, nothing
+                     -- to deliver). konami.cpp completes such reads with whatever is in its
+                     -- stale Sector[] buffer (konami.cpp:166-171, fread!=2048 tolerated, the
+                     -- error log at :169 is commented out upstream). Serve the buffer as-is
+                     -- and complete instead of hanging the game forever.
+                     disc_req    <= '0';
+                     bufferValid <= '1';
+                     discState   <= D_IDLE;
                   end if;
 
                when D_WAITDONE =>
+                  fetch_tout <= fetch_tout + 1;
                   if disc_ack = '0' then                          -- block now resident in buffer
                      if blkIdx = '0' then
                         blkIdx    <= '1';
@@ -573,6 +830,10 @@ begin
                         bufferValid <= '1';
                         discState   <= D_IDLE;
                      end if;
+                  elsif fetch_tout = (fetch_tout'range => '1') then
+                     disc_req    <= '0';                          -- same stale-serve escape as D_WAITSTART
+                     bufferValid <= '1';
+                     discState   <= D_IDLE;
                   end if;
             end case;
 
@@ -619,9 +880,13 @@ begin
             if v_tbreset = '1' then
                TrackballX <= (others => '0');
                TrackballY <= (others => '0');
-            elsif mouse_event = '1' then
-               v_tx := resize(TrackballX, 13) + resize(mouse_x, 13);
-               v_ty := resize(TrackballY, 13) + resize(mouse_y, 13);
+            elsif mouse_event /= mouse_event_q then
+               -- mouse_event is the hps_io ps2_mouse[24] TOGGLE (flips once per packet), NOT a
+               -- pulse: level-accumulating added each delta every ce cycle the toggle sat high
+               -- (~16M adds/packet -> instant +/-2048 saturation = "hypersensitive Y, dead X").
+               -- Count each packet ONCE (either edge) and scale by the OSD trackball speed.
+               v_tx := resize(TrackballX, 13) + resize(shift_right(mouse_x, to_integer(unsigned(tball_speed))), 13);
+               v_ty := resize(TrackballY, 13) + resize(shift_right(mouse_y, to_integer(unsigned(tball_speed))), 13);
                if    v_tx >  2047 then TrackballX <= to_signed( 2047, 12);
                elsif v_tx < -2048 then TrackballX <= to_signed(-2048, 12);
                else                    TrackballX <= resize(v_tx, 12); end if;
@@ -629,6 +894,7 @@ begin
                elsif v_ty < -2048 then TrackballY <= to_signed(-2048, 12);
                else                    TrackballY <= resize(v_ty, 12); end if;
             end if;
+            mouse_event_q <= mouse_event;
 
          end if;
       end if;

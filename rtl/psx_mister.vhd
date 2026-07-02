@@ -257,6 +257,7 @@ entity psx_mister is
       multitapAnalog        : in  std_logic;
       -- mouse
       MouseEvent            : in  std_logic;
+      tball_speed           : in  std_logic_vector(1 downto 0);
       MouseLeft             : in  std_logic;
       MouseRight            : in  std_logic;
       MouseX                : in  signed(8 downto 0);
@@ -305,7 +306,8 @@ entity psx_mister is
       Cheats_BusWriteData   : out    std_logic_vector(31 downto 0);
       Cheats_Bus_ena        : out    std_logic := '0';
       Cheats_BusReadData    : in     std_logic_vector(31 downto 0);
-      Cheats_BusDone        : in     std_logic
+      Cheats_BusDone        : in     std_logic;
+      cpu_pc_out            : out    unsigned(31 downto 0) := (others => '0')   -- sim: CPU PC tap
    );
 end entity;
 
@@ -660,6 +662,7 @@ begin
       padMode               => padMode,
 
       MouseEvent            => MouseEvent,
+      tball_speed           => tball_speed,
       MouseLeft             => MouseLeft,
       MouseRight            => MouseRight,
       MouseX                => MouseX,
@@ -704,8 +707,9 @@ begin
       Cheats_BusWriteData   => Cheats_BusWriteData,
       Cheats_Bus_ena        => Cheats_Bus_ena,
       Cheats_BusReadData    => Cheats_BusReadData,
-      Cheats_BusDone        => Cheats_BusDone
-   );                          
+      Cheats_BusDone        => Cheats_BusDone,
+      cpu_pc_dbg_out        => cpu_pc_out
+   );
 
 end architecture;
 

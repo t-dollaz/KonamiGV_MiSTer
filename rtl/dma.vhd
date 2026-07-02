@@ -416,6 +416,20 @@ begin
                            dmaArray(channel).channelOn <= '0';
                         end if;
                         triggerDMA(channel) <= '0';
+
+                        -- GV/573 ch5 TO-DEVICE (CHCR bit0=1, e.g. MODE SELECT parameter phase):
+                        -- discard-and-complete, never start the engine. DuckStation intercepts
+                        -- EVERY ch5 CHCR write before its DMA engine (dma.cpp:170-173 ->
+                        -- KonamiDmaControlWrite); with direction=to-device it does NO data work
+                        -- (konami.cpp:148 gates on (Value&1)==0) and clears the SCSI phase bits
+                        -- unconditionally (konami.cpp:194). Mirror: clear busy/start so the
+                        -- engine never runs, pulse dma5_done so konami573 clears its phase.
+                        if (channel = 5 and bus_dataWrite(0) = '1') then
+                           dmaArray(5).D_CHCR(24) <= '0';
+                           dmaArray(5).D_CHCR(28) <= '0';
+                           dmaArray(5).channelOn  <= '0';
+                           dma5_done <= '1';
+                        end if;
                         
                         if (channel = 2 and bus_dataWrite(10 downto 9) = "10") then
                            dmaArray(2).chopwaiting   <= '1';
@@ -573,7 +587,7 @@ begin
                      end if;
                   end if;
                   
-                  if (dmaSettings.D_CHCR(8) = '1' and activeChannel /= 3 and activeChannel /= 6) then
+                  if (dmaSettings.D_CHCR(8) = '1' and activeChannel /= 3 and activeChannel /= 5 and activeChannel /= 6) then
                      errorCHOP <= '1';
                   end if;
                   

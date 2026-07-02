@@ -56,6 +56,8 @@ entity memorymux is
       
       ex1_memctrl          : in  unsigned(13 downto 0);
       bus_exp1_addr        : out unsigned(22 downto 0);
+      bus_exp1_bstep       : out std_logic_vector(1 downto 0);  -- ext_byteStep: which byte of the CPU access this step serves (konami.cpp lane semantics)
+      bus_exp1_a10         : out std_logic_vector(1 downto 0);  -- CPU access address bits 1:0 (stable from access start)
       bus_exp1_dataWrite   : out std_logic_vector(7 downto 0);
       bus_exp1_read        : out std_logic;
       bus_exp1_write       : out std_logic;
@@ -961,6 +963,8 @@ begin
    -- an odd register (e.g. IRQSTATE @ 0x0A = lane 2) then aliased to the even neighbour (STATUS @ 0x08) and skipped
    -- IRQSTATE's clear-STATUS-0x80 side-effect, stalling the 573 BIOS. Add the offset low bits on reads only.
    exp1_byte_lane     <= ext_byteStep + ext_bus_addr_ex1(1 downto 0) when (ext_state = EXT_READ_NEXT) else ext_byteStep;
+   bus_exp1_bstep     <= std_logic_vector(ext_byteStep);  -- lane-within-CPU-access, decoupled from the address (konami.cpp semantics)
+   bus_exp1_a10       <= std_logic_vector(ext_bus_addr_ex1(1 downto 0));  -- CPU access address bits 1:0, stable from access start (RAM-backed devices need early addressing)
    bus_exp1_addr      <= ext_bus_addr_ex1(22 downto 2) & exp1_byte_lane;  -- word base + byte lane
    bus_exp1_write     <= '1' when (ext_write_ena = '1' and ext_select_ex1_saved = '1') else '0';
    bus_exp1_dataWrite <= ext_dataWrite(7 downto 0);
@@ -1081,7 +1085,19 @@ begin
                   ext_memctrl_Hold     <= ext_memctrl(9);
                   ext_memctrl_Float    <= ext_memctrl(10);
                   ext_memctrl_PStrobe  <= ext_memctrl(11);
-                  ext_memctrl_width    <= ext_memctrl(12);
+                  -- GV/573: EXP1 always byte-steps regardless of the programmed bus width.
+                  -- The game reconfigures EXP1 MEMCTRL to 16-bit (write 0x173F47 at pc
+                  -- 0x80064E80 -- the very write a1up keyed KonamiScoreInit on, bit12 = width)
+                  -- right before its security check; with width honored, a 16-bit read
+                  -- completes in ONE strobe against our 8-bit konami573 port and returns half
+                  -- the data (lhu 0x1F180084 -> ~0x0008 instead of 0x0F08 -> SECURITY CODE
+                  -- ERROR). DuckStation ignores MEMCTRL width for EXP1 entirely (konami.cpp is
+                  -- size-agnostic) -- mirror that.
+                  if (ext_select_ex1 = '1') then
+                     ext_memctrl_width <= '0';
+                  else
+                     ext_memctrl_width <= ext_memctrl(12);
+                  end if;
                   ext_memctrl_autoinc  <= ext_memctrl(13);
                   
                   if (state = BUSWRITEEXTERNAL) then

@@ -301,7 +301,7 @@ architecture arch of cd_top is
    signal sectorBuffer_addrB        : std_logic_vector(9 downto 0);
    signal sectorBuffer_DataB        : std_logic_vector(31 downto 0);
       
-   signal positionInIndex           : integer range -524288 to 524287; 
+   signal positionInIndex           : integer range -524288 to 524287 := 0;
    signal lastReadSector            : integer range 0 to 524287; 
    signal subchannelSector          : integer range 0 to 524287; 
    signal fetchCount                : integer range 0 to 588;

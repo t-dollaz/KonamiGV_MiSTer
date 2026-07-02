@@ -201,9 +201,23 @@ architecture arch of cpu is
    signal FetchLastCache               : std_logic := '0';
    signal FetchLastTagvalids           : std_logic_vector(3 downto 0);
    
-   signal cacheValueLast               : unsigned(31 downto 0) := (others => '0'); 
+   signal cacheValueLast               : unsigned(31 downto 0) := (others => '0');
    signal cacheHitLast                 : std_logic := '0';
-   
+
+   -- System 573 fix: the i-cache tag/data read ports (tag_q_b, cache_q_b) are
+   -- synchronous (1-cycle latency) on cache_address_b = FetchAddr(11:4). On a
+   -- branch/exception REDIRECT the line index can jump discontinuously, so for
+   -- that one cycle the lagged reads still reflect the PREVIOUS line. If the
+   -- previous line happens to share the redirect target's index AND its stale
+   -- tag spuriously matches, cacheHitTest hits and delivers the OLD line data
+   -- (wrong instruction). cacheLineFetched records the line index actually
+   -- presented to the RAM last cycle; when it differs from the current
+   -- FetchAddr line, the reads are not yet valid and the hit must be ignored
+   -- (forcing the normal miss/refetch path -- the same path a sequential line
+   -- crossing already takes, so steady-state timing is unchanged).
+   signal cacheLineFetched             : unsigned(7 downto 0) := (others => '1');
+   signal cacheLineValid               : std_logic := '0';
+
    -- regs           
    signal blockIRQ                     : std_logic := '0';
    signal blockIRQCnt                  : integer range 0 to 10;
@@ -648,8 +662,14 @@ begin
                       
    cache_address_b <= std_logic_vector(FetchAddr(11 downto 4));
    
-   cacheHitTest    <= '1' when (unsigned(tag_q_b(19 downto 0)) = FetchAddr(31 downto 12) and tag_q_b(20 + to_integer(unsigned(FetchAddr(3 downto 2)))) = '1') else '0';
-            
+   -- System 573 fix: only honor a cache hit when the synchronous tag/data reads
+   -- actually correspond to the current FetchAddr line (i.e. the same line index
+   -- was presented to the RAM last cycle). On a redirect that crossed into a new
+   -- line the reads are stale, so suppress the hit and take the miss/refetch path.
+   cacheHitTest    <= '1' when (cacheLineValid = '1' and cacheLineFetched = FetchAddr(11 downto 4)
+                                and unsigned(tag_q_b(19 downto 0)) = FetchAddr(31 downto 12)
+                                and tag_q_b(20 + to_integer(unsigned(FetchAddr(3 downto 2)))) = '1') else '0';
+
 
    mem1_address    <= FetchAddr;
 
@@ -675,8 +695,12 @@ begin
       
       if (mem_done = '1' and memoryMuxStage4 = '0') then 
          case (to_integer(unsigned(FetchLastAddr(31 downto 29)))) is
-            when 0 | 4 => -- cached
-               tag_wren_a   <= '1';
+            when 0 | 4 => -- cached (but NOT the 573 BIOS mirror, which runs uncached)
+               if (FetchLastAddr(28 downto 0) >= 16#1FC00000# and FetchLastAddr(28 downto 0) < 16#1FC80000#) then
+                  null;
+               else
+                  tag_wren_a   <= '1';
+               end if;
             when others => null;
          end case;
       end if;
@@ -704,7 +728,15 @@ begin
             case (to_integer(FetchAddr(31 downto 29))) is
                
                when 0 | 4 => -- cache
-                  if (cacheHitTest = '1') then
+                  if (FetchAddr(28 downto 0) >= 16#1FC00000# and FetchAddr(28 downto 0) < 16#1FC80000#) then
+                     -- System 573: the BIOS runs from the cached KSEG0 mirror
+                     -- (0x9FC00000), an access pattern the upstream i-cache fill/hold
+                     -- path mishandles (delivers a stale word -> bad jump -> crash).
+                     -- Run BIOS fetches uncached, as a real PSX does (the kernel runs
+                     -- from 0xBFC00000); games still execute cached from RAM.
+                     mem1_request      <= '1';
+                     stallNew1         <= '1';
+                  elsif (cacheHitTest = '1') then
                      cacheHitNext      <= '1';
                      PCnext            <= FetchAddr + 4;
                   else
@@ -766,23 +798,33 @@ begin
    process (clk1x)
    begin
       if (rising_edge(clk1x)) then
-         
+
          ce_1 <= ce;
-      
+
+         -- System 573 fix: mirror the i-cache read-port latency. cache_q_b/tag_q_b
+         -- read cache_address_b (= FetchAddr(11:4)) on every clk1x edge with one
+         -- cycle of latency, so on the NEXT edge they reflect THIS edge's line.
+         -- Record that line so cacheHitTest can tell whether the reads are valid
+         -- for the current FetchAddr (they are not on a redirect into a new line).
+         cacheLineFetched <= FetchAddr(11 downto 4);
+         cacheLineValid   <= '1';
+
          if (reset = '1') then
-                     
+
             stall1         <= '0';
             PC             <= unsigned(ss_in(0)); -- x"BFC00000";
-                           
+
             blockIRQ       <= '0'; -- todo: busy for savestate?
             blockirqCnt    <= 0;
             fetchReady     <= ss_in(25)(0);
             opcode0        <= unsigned(ss_in(14));
             PCold0         <= unsigned(ss_in(19));
-            
+
             cacheHit       <= '0';
             cacheHitLast   <= '0';
-         
+
+            cacheLineValid <= '0';
+
          elsif (ce = '1') then
             
             fetchReady     <= fetchReadyNext;
@@ -837,16 +879,14 @@ begin
 --##############################################################
 --############################### stage 2
 --##############################################################
-   
+
    opcodeCacheMuxed <= cacheValueLast when cacheHitLast = '1' else
                        unsigned(cache_q_b( 31 downto  0)) when (cacheHit = '1' and PCold0(3 downto 2) = "00") else
                        unsigned(cache_q_b( 63 downto 32)) when (cacheHit = '1' and PCold0(3 downto 2) = "01") else
                        unsigned(cache_q_b( 95 downto 64)) when (cacheHit = '1' and PCold0(3 downto 2) = "10") else
                        unsigned(cache_q_b(127 downto 96)) when (cacheHit = '1' and PCold0(3 downto 2) = "11") else
                        opcode0;
-                       
-                       
-                       
+
    decImmData    <= opcodeCacheMuxed(15 downto 0);
    decJumpTarget <= opcodeCacheMuxed(25 downto 0);
    decSource1    <= opcodeCacheMuxed(25 downto 21);

@@ -418,14 +418,18 @@ begin
                end if;
 
                if (isVsync = '0') then
-                  if (videoout_settings.GPUSTAT_VerRes = '1') then
-                     if (videoout_reports.interlacedDisplayField = '1') then
-                        lineIn <= to_unsigned(((vdispNew - vDisplayStart) * 2) + 1, 9);
+                  if vdispNew >= vDisplayStart then
+                     if (videoout_settings.GPUSTAT_VerRes = '1') then
+                        if (videoout_reports.interlacedDisplayField = '1') then
+                           lineIn <= to_unsigned(((vdispNew - vDisplayStart) * 2) + 1, 9);
+                        else
+                           lineIn <= to_unsigned((vdispNew - vDisplayStart) * 2, 9);
+                        end if;
                      else
-                        lineIn <= to_unsigned((vdispNew - vDisplayStart) * 2, 9);
+                        lineIn <= to_unsigned(vdispNew - vDisplayStart, 9);
                      end if;
                   else
-                     lineIn <= to_unsigned(vdispNew - vDisplayStart, 9);
+                     lineIn <= (others => '0');
                   end if;
                end if;
 
@@ -522,9 +526,11 @@ begin
                   if (vdispNew = vtotal) then
                      if (rotate180 = '1') then
                         if (videoout_settings.GPUSTAT_VerRes = '1' and interlacedDisplayFieldMuxed = '1') then
-                           nextLineCalc := to_unsigned((lineMax - 2), 9);
+                           if lineMax >= 2 then nextLineCalc := to_unsigned(lineMax - 2, 9);
+                           else nextLineCalc := to_unsigned(0, 9); end if;
                         else
-                           nextLineCalc := to_unsigned((lineMax - 1), 9);
+                           if lineMax >= 1 then nextLineCalc := to_unsigned(lineMax - 1, 9);
+                           else nextLineCalc := to_unsigned(0, 9); end if;
                         end if;
                      else
                         if (videoout_settings.GPUSTAT_VerRes = '1' and interlacedDisplayFieldMuxed = '1') then
@@ -550,7 +556,8 @@ begin
                nextLineCalcSaved <= nextLineCalc;
                
                if (rotate180 = '1') then
-                  videoout_request.lineInNext <= to_unsigned((lineMax - 1), 9) - nextLineCalc;
+                  if lineMax >= 1 then videoout_request.lineInNext <= to_unsigned(lineMax - 1, 9) - nextLineCalc;
+                  else videoout_request.lineInNext <= (others => '0'); end if;
                else
                   videoout_request.lineInNext <= nextLineCalc;
                end if;
@@ -681,7 +688,8 @@ begin
                   videoout_out.hblank         <= '1';
                   videoout_reports.hblank_tmr <= '1';
                   
-                  nextLineCalc := to_unsigned((lineMax - 1), 9) - lineIn;
+                  if lineMax >= 1 then nextLineCalc := to_unsigned(lineMax - 1, 9) - lineIn;
+                  else nextLineCalc := (others => '0'); end if;
                   
                   if ((rotate180 = '1' and nextLineCalc /= videoout_request.lineDisp) or (rotate180 = '0' and lineIn /= videoout_request.lineDisp)) then
                      state <= WAITHBLANKEND;

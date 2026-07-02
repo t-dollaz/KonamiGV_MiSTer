@@ -28,7 +28,9 @@ entity irq is
       bus_dataRead         : out std_logic_vector(31 downto 0);
       
       irqRequest           : out std_logic := '0';
-      
+
+      dbg_istat10          : out std_logic := '0';   -- GV debug: live I_STATUS(10) (IRQ10 latched, synthesizable)
+
 -- synthesis translate_off
       export_irq           : out unsigned(15 downto 0);
 -- synthesis translate_on
@@ -65,6 +67,8 @@ begin
 -- synthesis translate_on
 
    irqRequest <= '1' when ((I_STATUS and I_MASK(10 downto 0)) > 0) else '0';
+
+   dbg_istat10 <= I_STATUS(10);
    
    irqIn(0)  <= irq_VBLANK;  
    irqIn(1)  <= irq_GPU;     

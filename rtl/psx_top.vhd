@@ -216,6 +216,7 @@ entity psx_top is
       padMode               : out std_logic_vector(1 downto 0);
 
       MouseEvent            : in  std_logic;
+      tball_speed           : in  std_logic_vector(1 downto 0);
       MouseLeft             : in  std_logic;
       MouseRight            : in  std_logic;
       MouseX                : in  signed(8 downto 0);
@@ -260,7 +261,8 @@ entity psx_top is
       Cheats_BusWriteData   : out    std_logic_vector(31 downto 0);
       Cheats_Bus_ena        : out    std_logic := '0';
       Cheats_BusReadData    : in     std_logic_vector(31 downto 0);
-      Cheats_BusDone        : in     std_logic
+      Cheats_BusDone        : in     std_logic;
+      cpu_pc_dbg_out        : out    unsigned(31 downto 0) := (others => '0')   -- sim: CPU PC tap
    );
 end entity;
 
@@ -368,6 +370,12 @@ architecture arch of psx_top is
    
    signal ex1_memctrl            : unsigned(13 downto 0);
    signal bus_exp1_addr          : unsigned(22 downto 0);
+   signal bus_exp1_bstep         : std_logic_vector(1 downto 0);   -- CPU-access byte-step (konami.cpp lane semantics)
+   signal bus_exp1_a10           : std_logic_vector(1 downto 0);   -- CPU access address bits 1:0 (early-stable)
+   signal dbg_istat10            : std_logic;                      -- live I_STATUS(10) from irq.vhd
+   signal istat10_q              : std_logic := '0';
+   signal irq10_rise_cnt         : unsigned(7 downto 0) := (others => '0');  -- IRQ10 latched into I_STAT (saturating)
+   signal irq10_fall_cnt         : unsigned(7 downto 0) := (others => '0');  -- IRQ10 acked by CPU (saturating)
    signal bus_exp1_dataWrite     : std_logic_vector(7 downto 0);
    signal bus_exp1_read          : std_logic;
    signal bus_exp1_write         : std_logic;
@@ -496,7 +504,8 @@ architecture arch of psx_top is
    signal mem_tagvalids          : std_logic_vector(3 downto 0);
    
    signal ram_next_cpu           : std_logic;
-   
+   signal ram_Adr_pre            : std_logic_vector(24 downto 0); -- pre-4MB-mask address
+
    signal ram_cpu_dataWrite      : std_logic_vector(31 downto 0);
    signal ram_cpu_Adr            : std_logic_vector(24 downto 0);
    signal ram_cpu_be             : std_logic_vector(3 downto 0);
@@ -907,6 +916,25 @@ begin
       end if;
    end process;
    
+   -- GV debug: count IRQ10 deliveries (I_STATUS(10) rise) and CPU acks (fall)
+   process (clk1x)
+   begin
+      if rising_edge(clk1x) then
+         istat10_q <= dbg_istat10;
+         if reset_intern = '1' then
+            irq10_rise_cnt <= (others => '0');
+            irq10_fall_cnt <= (others => '0');
+         else
+            if dbg_istat10 = '1' and istat10_q = '0' and irq10_rise_cnt /= x"FF" then
+               irq10_rise_cnt <= irq10_rise_cnt + 1;
+            end if;
+            if dbg_istat10 = '0' and istat10_q = '1' and irq10_fall_cnt /= x"FF" then
+               irq10_fall_cnt <= irq10_fall_cnt + 1;
+            end if;
+         end if;
+      end if;
+   end process;
+
    -- DDR3 arbiter
    process (clk2x)
    begin
@@ -1038,7 +1066,9 @@ begin
    -- Runtime: konami573 pulses flash_fetch (clk1x) with flash_word_addr -> read the 64-bit
    --   DDR3 line, extract the 16-bit lane -> flash_data. Prefetch hides latency (no EXP1 stall).
    -- Download: PSX.sv streams 16-bit words (flash_dl_req held, paced by ioctl_wait) -> BE write.
-   -- The arbiter's vram-pause serializes DDR3, so the next DOUT_READY after our ack is ours.
+   -- Reads hold memFlash_request until DOUT_READY so the arbiter keeps vram_pause asserted for
+   -- the whole round trip — ddr3_DOUT_READY is untagged and shared by every consumer, so the
+   -- response window must stay exclusive (stock precedent: spu_ram.vhd read FSM).
    process (clk2x)
    begin
       if rising_edge(clk2x) then
@@ -1083,13 +1113,19 @@ begin
 
                when FL_REQ =>
                   if (memFlash_ack = '1') then
-                     memFlash_request <= '0';
                      memFlash_RD      <= '0';
                      memFlash_WE      <= '0';
                      if (fl_isWrite = '1') then
+                        memFlash_request <= '0';
                         flash_dl_done <= '1';        -- level: held until PSX.sv drops flash_dl_req
                         flashState    <= FL_DLWAIT;
                      else
+                        -- READ: keep memFlash_request asserted through FL_RDWAIT. The arbiter's
+                        -- WAITDONE holds vram_pause while (request and acknext)='1'; releasing
+                        -- request before our DOUT_READY lets the GPU issue a read whose beats
+                        -- interleave with ours on the shared untagged ddr3_DOUT_READY (all
+                        -- consumers see the raw pulse). Stock contract: spu_ram.vhd holds
+                        -- mem_request until the last read beat (MEMREAD_READDATA).
                         flashState    <= FL_RDWAIT;
                      end if;
                   end if;
@@ -1102,6 +1138,7 @@ begin
 
                when FL_RDWAIT =>
                   if (ddr3_DOUT_READY = '1') then
+                     memFlash_request <= '0';   -- our beat has landed; NOW release the arbiter/vram_pause
                      case fl_lane is
                         when "00"   => flash_data <= ddr3_DOUT(15 downto 0);
                         when "01"   => flash_data <= ddr3_DOUT(31 downto 16);
@@ -1167,11 +1204,11 @@ begin
    -- Gun coordinate mapping is toplevel so that the gun's
    -- coordinates can be passed to both joypad
    -- and GPU (for crosshair overlays)
-   Gun1X <= to_unsigned(to_integer(joypad1.Analog1X + 128), 8);
-   Gun2X <= to_unsigned(to_integer(joypad2.Analog1X + 128), 8);
+   Gun1X <= to_unsigned(to_integer(joypad1.Analog1X) + 128, 8);
+   Gun2X <= to_unsigned(to_integer(joypad2.Analog1X) + 128, 8);
 
-   Gun1Y <= to_unsigned(to_integer(joypad1.Analog1Y + 128), 8);
-   Gun2Y <= to_unsigned(to_integer(joypad2.Analog1Y + 128), 8);
+   Gun1Y <= to_unsigned(to_integer(joypad1.Analog1Y) + 128, 8);
+   Gun2Y <= to_unsigned(to_integer(joypad2.Analog1Y) + 128, 8);
 
    Gun1AimOffscreen <= '1' when Gun1X = x"00" or Gun1X = x"FF" or Gun1Y = x"00" or Gun1Y = x"FF" else '0';
    Gun2AimOffscreen <= '1' when Gun2X = x"00" or Gun2X = x"FF" or Gun2Y = x"00" or Gun2Y = x"FF" else '0';
@@ -1375,6 +1412,8 @@ begin
       
       irqRequest           => irqRequest,
 
+      dbg_istat10          => dbg_istat10,
+
 -- synthesis translate_off
       export_irq           => export_irq,
 -- synthesis translate_on
@@ -1490,10 +1529,12 @@ begin
    ram_dma       <= '1'                when (cpuPaused = '1') else '0';      
    ram_cache     <= '0'                when (cpuPaused = '1') else ram_cpu_cache;    
    
-   ram_Adr       <=   "00" & ram_dma_Adr(22 downto 0) when (cpuPaused = '1' and ram8mb = '1') else 
-                    "0000" & ram_dma_Adr(20 downto 0) when (cpuPaused = '1' and ram8mb = '0') else 
+   ram_Adr_pre   <=   "00" & ram_dma_Adr(22 downto 0) when (cpuPaused = '1' and ram8mb = '1') else
+                    "0000" & ram_dma_Adr(20 downto 0) when (cpuPaused = '1' and ram8mb = '0') else
                     ram_cpu_Adr(24 downto 23) &        ram_cpu_Adr(22 downto 0) when (ram8mb = '1') else
                     ram_cpu_Adr(24 downto 23) & "00" & ram_cpu_Adr(20 downto 0);
+
+   ram_Adr       <= ram_Adr_pre;
    
    process (clk1x)
    begin
@@ -1549,67 +1590,26 @@ begin
       SS_DataRead          => SS_DataRead_TIMER
    );
    
-   icd_top : entity work.cd_top
-   port map
-   (
-      clk1x                => clk1x,
-      ce                   => ce,   
-      reset                => reset_intern,
-     
-      INSTANTSEEK          => INSTANTSEEK,
-      FORCECDSPEED         => FORCECDSPEED,
-      LIMITREADSPEED       => LIMITREADSPEED,
-      hasCD                => hasCD,
-      fastCD               => fastCD,
-      testSeek             => testSeek,
-      pauseOnCDSlow        => pauseOnCDSlow,
-      LIDopen              => LIDopen,
-      region               => region,
-      region_out           => region_out,	  
-      
-      pauseCD              => pauseCD,
-      Pause_idle_cd        => Pause_idle_cd,
-      cdSlow               => cdSlow,
-      error                => errorCD,
-      LBAdisplay           => LBAdisplay,
-          
-      irqOut               => irq_CDROM,
-      
-      spu_tick             => spu_tick,
-      cd_left              => cd_left,
-      cd_right             => cd_right,
-      
-      mdec_idle            => SS_Idle_mdec,
-                            
-      bus_addr             => bus_cd_addr,     
-      bus_dataWrite        => bus_cd_dataWrite,
-      bus_read             => bus_cd_read,     
-      bus_write            => bus_cd_write,     
-      bus_dataRead         => bus_cd_dataRead,
-                            
-      dma_read             => DMA_CD_readEna,
-      dma_readdata         => DMA_CD_read,
-      
-      cd_hps_req           => cd_hps_req,  
-      cd_hps_lba           => cd_hps_lba,
-      cd_hps_lba_sim       => cd_hps_lba_sim,
-      cd_hps_ack           => cd_hps_ack,
-      cd_hps_write         => cd_hps_write,
-      cd_hps_data          => cd_hps_data, 
-      
-      trackinfo_data       => trackinfo_data,
-      trackinfo_addr       => trackinfo_addr, 
-      trackinfo_write      => trackinfo_write,
-      resetFromCD          => resetFromCD,
-      
-      SS_reset             => SS_reset,
-      SS_DataWrite         => SS_DataWrite,
-      SS_Adr               => SS_Adr(13 downto 0),      
-      SS_wren              => SS_wren(13),     
-      SS_rden              => SS_rden(13),     
-      SS_DataRead          => SS_DataRead_CD,
-      SS_Idle              => SS_Idle_cd
-   );
+   -- GV: cd_top (consumer PSX CD-ROM controller) removed -- frees ~2.9k ALMs.
+   -- The GV uses NCR53CF96 SCSI via EXP1; cd_top is fully dormant.
+   -- CRITICAL: SS_Idle_cd and Pause_idle_cd must be '1' or savestate/pause hangs.
+   region_out       <= region;
+   pauseCD          <= '0';
+   Pause_idle_cd    <= '1';
+   cdSlow           <= '0';
+   errorCD          <= '0';
+   LBAdisplay       <= (others => '0');
+   irq_CDROM        <= '0';
+   cd_left          <= (others => '0');
+   cd_right         <= (others => '0');
+   bus_cd_dataRead  <= (others => '0');
+   DMA_CD_read      <= (others => '0');
+   cd_hps_req       <= '0';
+   cd_hps_lba       <= (others => '0');
+   cd_hps_lba_sim   <= (others => '0');
+   resetFromCD      <= '0';
+   SS_DataRead_CD   <= (others => '0');
+   SS_Idle_cd       <= '1';
 
    cdslowEna <= cdSlow and cdslowOn;
 
@@ -1891,6 +1891,7 @@ begin
    process (clk1x) begin
       if rising_edge(clk1x) then cpu_pc_dbg_r <= cpu_pc_dbg; end if;
    end process;
+   cpu_pc_dbg_out <= cpu_pc_dbg;
 
    ikonami573 : entity work.konami573
    port map
@@ -1900,6 +1901,11 @@ begin
       reset                => reset_intern,
 
       bus_addr             => bus_exp1_addr,
+      bus_bstep            => bus_exp1_bstep,
+      bus_a10              => bus_exp1_a10,
+      irq10_rise_cnt       => irq10_rise_cnt,
+      irq10_fall_cnt       => irq10_fall_cnt,
+      tball_speed          => tball_speed,
       bus_dataWrite        => bus_exp1_dataWrite,
       bus_read             => bus_exp1_read,
       bus_write            => bus_exp1_write,
@@ -1999,6 +2005,8 @@ begin
 
       ex1_memctrl          => ex1_memctrl,
       bus_exp1_addr        => bus_exp1_addr,
+      bus_exp1_bstep       => bus_exp1_bstep,
+      bus_exp1_a10         => bus_exp1_a10,
       bus_exp1_dataWrite   => bus_exp1_dataWrite,
       bus_exp1_read        => bus_exp1_read,
       bus_exp1_write       => bus_exp1_write,

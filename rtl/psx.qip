@@ -37,9 +37,10 @@ set_global_assignment -name VHDL_FILE [file join $::quartus(qip_path) gte_mac123
 set_global_assignment -name VHDL_FILE [file join $::quartus(qip_path) gte_UNRDivide.vhd ]
 set_global_assignment -name VHDL_FILE [file join $::quartus(qip_path) gte.vhd ]
 set_global_assignment -name VHDL_FILE [file join $::quartus(qip_path) mdec.vhd ]
-set_global_assignment -name VHDL_FILE [file join $::quartus(qip_path) cd_xa_zigzag.vhd ]
-set_global_assignment -name VHDL_FILE [file join $::quartus(qip_path) cd_xa.vhd ]
-set_global_assignment -name VHDL_FILE [file join $::quartus(qip_path) cd_top.vhd ]
+# GV: cd_top and cd_xa helpers removed -- frees ~2.9k ALMs for timing closure (psx_patches/0011)
+#set_global_assignment -name VHDL_FILE [file join $::quartus(qip_path) cd_xa_zigzag.vhd ]
+#set_global_assignment -name VHDL_FILE [file join $::quartus(qip_path) cd_xa.vhd ]
+#set_global_assignment -name VHDL_FILE [file join $::quartus(qip_path) cd_top.vhd ]
 set_global_assignment -name VHDL_FILE [file join $::quartus(qip_path) memctrl.vhd ]
 set_global_assignment -name VHDL_FILE [file join $::quartus(qip_path) sio.vhd ]
 set_global_assignment -name VHDL_FILE [file join $::quartus(qip_path) spu_ram.vhd ]
