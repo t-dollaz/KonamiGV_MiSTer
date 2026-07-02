@@ -68,7 +68,7 @@ game — cross-checked against MAME's `konamigv.cpp`. Several hard-won
 bring-up bugs came down to matching that reference's exact bus semantics;
 see `docs/BRINGUP_NOTES.md`.
 
-## Status — honest accounting
+## Core build status
 
 Boots and plays Simpsons Bowling on a DE10-nano-class board (HDMI + VGA,
 both timing corners met on the shipping build).
