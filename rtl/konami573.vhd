@@ -125,11 +125,18 @@ architecture arch of konami573 is
    -- sectors). Command addresses use the chip word address = FlashAddress; unlock matches
    -- on (addr & 0xFFF) as intelfsh does.
    type tFlashMode is (FM_NORMAL, FM_ID1, FM_ID2, FM_AMDID, FM_ERASE1, FM_ERASE2, FM_ERASE3, FM_ERASING, FM_PROG);
-   signal fl_mode_lo, fl_mode_hi     : tFlashMode := FM_NORMAL;
+   -- FOUR chip FSMs: the daughtercard is 4 independent 29F016As (board 3A/3B/7A/7B);
+   -- FlashAddress bit 21 selects the pair (konamigv.cpp:704 chip = FA >= 0x200000 ? 2 : 0),
+   -- the byte lane selects lo/hi within the pair. A shared per-lane FSM cross-contaminated
+   -- pairs (erasing 3A put 7A reads into status mode) - the bulk TEST-mode init interleaves
+   -- pairs and failed all four chips. Index = pair*2 + lane.
+   type tFlashModeArr is array(0 to 3) of tFlashMode;
+   type tFlashStatArr is array(0 to 3) of std_logic_vector(7 downto 0);
+   signal fl_mode : tFlashModeArr := (others => FM_NORMAL);
    -- erase status byte: DQ3=1 while erasing (intelfsh m_status = 1<<3); DQ6|DQ2 toggle on
    -- every read (intelfsh.cpp:600). DQ7 stays 0 until done. 29F016A returns status at ALL
    -- addresses while erasing (intelfsh.cpp:584 Firebeat note - no erase-sector range check).
-   signal fl_status_lo, fl_status_hi : std_logic_vector(7 downto 0) := x"08";
+   signal fl_status : tFlashStatArr := (others => x"08");
    -- op queue, 2 deep: a 16-bit program or a both-chips erase enqueues one op per lane.
    -- Flash software status-polls between operations, so depth 2 never overflows.
    type tOpAddr is array(0 to 1) of unsigned(23 downto 0);
@@ -463,7 +470,7 @@ begin
    -- status-poll loop against a multi-ms erase fill. Array reads additionally stall while
    -- write ops are queued/in flight (opq_any) so a read never returns pre-program data; the
    -- psx_top FSM invalidates flash_rdaddr after every op, forcing a fresh fetch.
-   fl_rd_mode <= fl_mode_lo when bus_addr(0) = '0' else fl_mode_hi;
+   fl_rd_mode <= fl_mode(to_integer(FlashAddress(21) & bus_addr(0 downto 0)));
    bus_exp1_wait <= '1' when (bus_read = '1' and region = 16#68# and
                               bus_addr(7 downto 4) = "1000" and bus_addr(3 downto 1) = "000" and
                               fl_rd_mode /= FM_AMDID and fl_rd_mode /= FM_ERASING and
@@ -562,6 +569,7 @@ begin
       variable v_ty       : signed(12 downto 0);
       variable v_pcphys   : unsigned(28 downto 0);
       variable v_pcvalid  : std_logic;
+      variable v_ci       : integer range 0 to 3;   -- flash chip index: pair(FA21)*2 + lane
 
       -- enqueue a 29F016A program/erase op at the write pointer. Depth-2 cannot overflow in
       -- practice (flash software status-polls between operations); a full queue drops the op.
@@ -591,10 +599,8 @@ begin
             ScsiFifoPtr  <= 0;
             ScsiIsRead   <= '0';
             FlashAddress <= (others => '0');
-            fl_mode_lo   <= FM_NORMAL;
-            fl_mode_hi   <= FM_NORMAL;
-            fl_status_lo <= x"08";
-            fl_status_hi <= x"08";
+            fl_mode      <= (others => FM_NORMAL);
+            fl_status    <= (others => x"08");
             opq_valid    <= "00";
             opq_rd       <= 0;
             opq_wr       <= 0;
@@ -873,16 +879,17 @@ begin
                            -- Value by chip mode (intelfsh.cpp read_full): AMDID -> maker/device ID,
                            -- ERASING -> toggling status byte, everything else (incl. mid-unlock-
                            -- sequence states) falls to the NORMAL array read, as MAME's default does.
+                           v_ci := to_integer(FlashAddress(21) & bus_addr(0 downto 0));
                            if bus_addr(0) = '0' then
-                              case fl_mode_lo is
+                              case fl_mode(v_ci) is
                                  when FM_AMDID =>
                                     if    FlashAddress(7 downto 0) = x"00" then bus_dataRead <= x"04"; -- MFG_FUJITSU
                                     elsif FlashAddress(7 downto 0) = x"01" then bus_dataRead <= x"AD"; -- 29F016A
                                     else                                        bus_dataRead <= x"00";
                                     end if;
                                  when FM_ERASING =>
-                                    bus_dataRead <= fl_status_lo;              -- DQ7=0 busy; DQ6|DQ2 toggle per read
-                                    fl_status_lo <= fl_status_lo xor x"44";
+                                    bus_dataRead <= fl_status(v_ci);           -- DQ7=0 busy; DQ6|DQ2 toggle per read
+                                    fl_status(v_ci) <= fl_status(v_ci) xor x"44";
                                  when others =>
                                     bus_dataRead <= flash_data(7 downto 0);    -- array: low byte (Flash[Chip])
                                     -- fix A (level form): request a DDR3 fetch of the CURRENT word;
@@ -893,15 +900,15 @@ begin
                                     end if;
                               end case;
                            else
-                              case fl_mode_hi is
+                              case fl_mode(v_ci) is
                                  when FM_AMDID =>
                                     if    FlashAddress(7 downto 0) = x"00" then bus_dataRead <= x"04";
                                     elsif FlashAddress(7 downto 0) = x"01" then bus_dataRead <= x"AD";
                                     else                                        bus_dataRead <= x"00";
                                     end if;
                                  when FM_ERASING =>
-                                    bus_dataRead <= fl_status_hi;
-                                    fl_status_hi <= fl_status_hi xor x"44";
+                                    bus_dataRead <= fl_status(v_ci);
+                                    fl_status(v_ci) <= fl_status(v_ci) xor x"44";
                                  when others =>
                                     bus_dataRead <= flash_data(15 downto 8);   -- array: high byte (Flash[Chip+1])
                               end case;
@@ -1042,9 +1049,10 @@ begin
                               when 0 =>
                                  -- data port, LO chip (konamigv.cpp flash_w case 0, data & 0xFF).
                                  -- Actions fire off the PRE-transition mode (intelfsh order).
-                                 if fl_mode_lo = FM_PROG then
+                                 v_ci := to_integer(FlashAddress(21 downto 21)) * 2;
+                                 if fl_mode(v_ci) = FM_PROG then
                                     flash_enqueue('0', FlashAddress, to_unsigned(0, 22), bus_dataWrite, '0');
-                                 elsif fl_mode_lo = FM_ERASE3 then
+                                 elsif fl_mode(v_ci) = FM_ERASE3 then
                                     if bus_dataWrite = x"10" and FlashAddress(11 downto 0) = x"555" then
                                        flash_enqueue('1', (FlashAddress and to_unsigned(16#200000#, 24)),         -- chip erase: whole 2MB lane
                                                      to_unsigned(16#200000#, 22), x"FF", '0');
@@ -1053,10 +1061,10 @@ begin
                                                      to_unsigned(16#010000#, 22), x"FF", '0');
                                     end if;
                                  end if;
-                                 fl_mode_lo <= flash_next_mode(fl_mode_lo, FlashAddress(11 downto 0), bus_dataWrite);
-                                 fl_status_lo <= x"08";
+                                 fl_mode(v_ci) <= flash_next_mode(fl_mode(v_ci), FlashAddress(11 downto 0), bus_dataWrite);
+                                 fl_status(v_ci) <= x"08";
                                  -- synthesis translate_off
-                                 report "DBG LOWR data=" & to_hstring(bus_dataWrite) & " FA=" & to_hstring(FlashAddress) & " mode=" & tFlashMode'image(fl_mode_lo) severity note;
+                                 report "DBG LOWR chip=" & integer'image(v_ci) & " data=" & to_hstring(bus_dataWrite) & " FA=" & to_hstring(FlashAddress) & " mode=" & tFlashMode'image(fl_mode(v_ci)) severity note;
                                  -- synthesis translate_on
                               when 2 => FlashAddress <= shift_left(resize(unsigned(bus_dataWrite), 24), 1);
                               when 4 => FlashAddress <= (FlashAddress and to_unsigned(16#FF00FF#, 24)) or
@@ -1071,9 +1079,10 @@ begin
                                  -- data port, HI chip (konamigv.cpp flash_w case 0, data >> 8).
                                  -- NOT a reapply: MAME issues exactly one write() per chip, and the
                                  -- byte-stepped bus hands us exactly one byte per chip. FA unchanged.
-                                 if fl_mode_hi = FM_PROG then
+                                 v_ci := to_integer(FlashAddress(21 downto 21)) * 2 + 1;
+                                 if fl_mode(v_ci) = FM_PROG then
                                     flash_enqueue('0', FlashAddress, to_unsigned(0, 22), bus_dataWrite, '1');
-                                 elsif fl_mode_hi = FM_ERASE3 then
+                                 elsif fl_mode(v_ci) = FM_ERASE3 then
                                     if bus_dataWrite = x"10" and FlashAddress(11 downto 0) = x"555" then
                                        flash_enqueue('1', (FlashAddress and to_unsigned(16#200000#, 24)),
                                                      to_unsigned(16#200000#, 22), x"FF", '1');
@@ -1082,10 +1091,10 @@ begin
                                                      to_unsigned(16#010000#, 22), x"FF", '1');
                                     end if;
                                  end if;
-                                 fl_mode_hi <= flash_next_mode(fl_mode_hi, FlashAddress(11 downto 0), bus_dataWrite);
-                                 fl_status_hi <= x"08";
+                                 fl_mode(v_ci) <= flash_next_mode(fl_mode(v_ci), FlashAddress(11 downto 0), bus_dataWrite);
+                                 fl_status(v_ci) <= x"08";
                                  -- synthesis translate_off
-                                 report "DBG HIWR data=" & to_hstring(bus_dataWrite) & " FA=" & to_hstring(FlashAddress) & " mode=" & tFlashMode'image(fl_mode_hi) severity note;
+                                 report "DBG HIWR chip=" & integer'image(v_ci) & " data=" & to_hstring(bus_dataWrite) & " FA=" & to_hstring(FlashAddress) & " mode=" & tFlashMode'image(fl_mode(v_ci)) severity note;
                                  -- synthesis translate_on
                               when 3 => FlashAddress <= resize(shift_left(resize(unsigned(bus_dataWrite) & fl_wr_lo, 25), 1), 24);
                               when 5 => FlashAddress <= (FlashAddress and to_unsigned(16#FF00FF#, 24)) or
@@ -1131,8 +1140,9 @@ begin
                -- on queue-empty keeps both DQ7s busy until all fills land - which is also what
                -- the software's "poll until both chips ready" loop expects.
                if opq_valid(1 - opq_rd) = '0' then
-                  if fl_mode_lo = FM_ERASING then fl_mode_lo <= FM_NORMAL; end if;
-                  if fl_mode_hi = FM_ERASING then fl_mode_hi <= FM_NORMAL; end if;
+                  for i in 0 to 3 loop
+                     if fl_mode(i) = FM_ERASING then fl_mode(i) <= FM_NORMAL; end if;
+                  end loop;
                end if;
             end if;
 

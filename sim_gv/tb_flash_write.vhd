@@ -583,6 +583,42 @@ begin
       end loop;
 
       ------------------------------------------------------------------
+      -- 6. FOUR-CHIP ISOLATION (the bulk-init killer): pair is FA bit 21
+      --    (konamigv.cpp:704). Put pair1-lo (chip 7A) in ID mode; pair0-lo (3A)
+      --    reads must still return ARRAY data, and vice versa on reset.
+      ------------------------------------------------------------------
+      setFA(16#200555#); wr16(x"1F680080", 16#AAAA#);
+      setFA(16#2002AA#); wr16(x"1F680080", 16#5555#);
+      setFA(16#200555#); wr16(x"1F680080", 16#9090#);   -- pair1 chips -> ID mode
+      setFA(16#200000#);
+      rd16(x"1F680080", r); chk("pair1 ID mode", r, x"0404");
+      setFA(16#10400#);                                  -- pair0 address
+      rd16(x"1F680080", r); chk("pair0 array while pair1 in ID", r, x"0400");
+      setFA(16#200000#); wr16(x"1F680080", 16#F0F0#);    -- reset pair1
+      setFA(16#200000#);
+      rd16(x"1F680080", r); chk("pair1 array after reset", r, x"0000");
+
+      -- pair0 sector erase must NOT put pair1 into status mode after completion
+      setFA(16#555#); wr16(x"1F680080", 16#AAAA#);
+      setFA(16#2AA#); wr16(x"1F680080", 16#5555#);
+      setFA(16#555#); wr16(x"1F680080", 16#8080#);
+      setFA(16#555#); wr16(x"1F680080", 16#AAAA#);
+      setFA(16#2AA#); wr16(x"1F680080", 16#5555#);
+      setFA(16#14000#); wr16(x"1F680080", 16#3030#);     -- erase pair0 sector @0x14000
+      polls := 0;
+      loop
+         setFA(16#14000#);
+         rd16(x"1F680080", r);
+         exit when r(7) = '1' and r(15) = '1';
+         polls := polls + 1;
+         assert polls < 100000 report "pair0 sector erase never completed" severity failure;
+      end loop;
+      setFA(16#14000#); rd16(x"1F680080", r); chk("pair0 sector erased", r, x"FFFF");
+      setFA(16#200100#); rd16(x"1F680080", r); chk("pair1 array after pair0 erase", r, x"0100");
+      setFA(16#0100#);   rd16(x"1F680080", r); chk("pair0 outside sector intact", r, x"FFFF");
+      -- ^ 0x0100 is inside sector 0 which scenario 5 erased -> 0xFFFF expected
+
+      ------------------------------------------------------------------
       write(l, string'("SUMMARY checks=")); write(l, integer'image(nchk));
       write(l, string'(" fails=")); write(l, integer'image(nfail)); writeline(output, l);
       if nfail = 0 then
