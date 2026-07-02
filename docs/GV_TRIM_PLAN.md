@@ -73,6 +73,35 @@ memcard-less, PSX-pad-less — board-confirmed). But full coverage needs:
 - **Tokimeki specialty I/O** (heartbeat/GSR/printer): niche; explicitly out
   of scope unless someone asks.
 
+## Adds from the fabricore patch-series review (2026-07-03)
+
+- **SNAC support**: remove with the memcards (their 0027 pairs memcard2+SNAC).
+  GV never uses real PSX controllers. Caveat: SNAC is also how a REAL
+  photodiode lightgun would connect - if Dead-Eye-on-CRT ever happens, gun
+  pulse input returns as its own small feature, not as pad SNAC.
+- **Strip blueprints exist**: their 0026 (joypad_pad + lightgun strip) and
+  0027 (memcard2 + SNAC) are reference diffs for our removals. Difference:
+  they stripped the gun files because 573 has no gun titles; we keep
+  justifier_sensor/gpu_crosshair for Dead Eye.
+- **Watch-list (latent GV bug classes proven on 573)**:
+  - CLUT-cache coherency saga (their 0013-0019, ending in rowlock+restore):
+    known PSX_MiSTer GPU bug class surfaced by arcade titles. If any GV title
+    shows texture/palette corruption, start here.
+  - CPU icache-redirect fix + BIOS-uncached (0004/0005): arcade-BIOS CPU bug
+    fixes - verify whether our upstream base already includes them; if not,
+    they are latent risks for the other 8 GV titles.
+  - SDRAM CAS latency 3 (0020), audio IIR passthrough (0025): candidates if
+    unexplained RAM/audio issues appear.
+- **Geometry confirmed for GV** (no 573-style patches needed): main RAM 2MB
+  (konamigv.cpp:579 set_default_size("2M") - the ram4mb lesson), VRAM 1MB
+  (konamigv.cpp:596 CXD8514Q config 0x100000; 573 needed their 0021 2MB/10-bit-Y
+  patch - we do NOT).
+- **GPU revision nuance**: Simpsons Bowling and Dead Eye run on the GV999
+  board revision with the CXD8561Q - the LATER GPU (konamigv.cpp:94,108),
+  not the ZV610's rev-0 CXD8514Q. The rev-0 quirk risk applies to the ZV610
+  titles (hyperath etc.), NOT to simpbowl. PSX_MiSTer's GPU model is closer
+  to our game than previously noted.
+
 ## System 573 compatibility notes (fabricore-eng/System573_MiSTer)
 
 Their core is ALSO a patched PSX_MiSTer — directly comparable. Deltas that
