@@ -102,6 +102,42 @@ memcard-less, PSX-pad-less — board-confirmed). But full coverage needs:
   titles (hyperath etc.), NOT to simpbowl. PSX_MiSTer's GPU model is closer
   to our game than previously noted.
 
+## Base-layer audit results (2026-07-03, fabricore base patches vs our tree)
+
+- **0004 icache-redirect + 0005 BIOS-uncached: ALREADY IN OUR TREE** (adopted
+  during the campaign; cpu.vhd:218-219/669-673/807-810 and :697-703/731-738;
+  upstream still lacks both). No action.
+- **CLUT palette-cache invalidation (net of their 0013-0019 saga): MISSING
+  here.** Their experiments constant-fold to a no-op except one refined fix:
+  pulse pipeline_clearCachePalette on cpu2vram_done OR vram2vram_done (our
+  gpu.vhd:988-989 clears only the texture cache). One-line, low-risk; a stale
+  cached CLUT after a palette blit at unchanged CLUT coords is the failure
+  mode. Simpbowl shows no symptom -> ADOPT AT THE BASE-LAYER MILESTONE, or
+  immediately if any GV title shows palette corruption.
+- **0020 CAS-3: skip for GV** (trigger is 573's continuous ch4 flash traffic;
+  we have no such channel). Revisit only on unexplained SDRAM miscapture.
+- **0025 audio-IIR passthrough: not a bug fix** - a resource-recovery hack
+  (~436 ALM + 8 DSP). NOTED AS AN ALM LEVER for our 98%-full device if the
+  trim ever needs one more notch.
+- **0001 EXP1 widening: architectural fork point for the shared base.** Their
+  EXP1 is 16-bit halfword-native (2 steps per word, no device-wait); ours is
+  8-bit byte-lane with konami.cpp lane semantics + bus_exp1_wait handshake -
+  hardware-proven and load-bearing for the GV security check. A 573 hat on
+  OUR base must either adapt to the byte-stepped contract (bandwidth cost on
+  573 flash boot) or the socket must offer both access models. Decision
+  deferred to the socket design; recorded in S573_PORTING_PLAN.md as well.
+
+## Socket inventory (hat interface prerequisites, from the same audit)
+
+- **RTC**: hps_io TIMESTAMP already lands in PSX.sv:544 (RTC_time[32:0]) and
+  is UNUSED - threading it down psx_mister -> psx_top -> hat is a clean add.
+- **Audio mix-in**: SPU sound_out_left/right pass straight to AUDIO_L/R at
+  PSX.sv:1375-1376 with no mixer; hat PCM needs a saturating adder there (or
+  at the psx_top sound_out boundary). No existing clamp stage to reuse.
+- **Soft reset request**: no in-fabric path exists; OR a hat's wd_expired
+  into reset_or (PSX.sv:340) or reset_in (psx_top.vhd:772). konami573 already
+  decodes the watchdog register and would only need the output.
+
 ## System 573 compatibility notes (fabricore-eng/System573_MiSTer)
 
 Their core is ALSO a patched PSX_MiSTer — directly comparable. Deltas that
