@@ -15,6 +15,18 @@ which boots, passes its security check, and plays on real hardware.
 > 93C46-class EEPROM. The authoritative hardware reference is MAME's
 > `konamigv.cpp`, not `ksys573.cpp`.
 
+## Quick start
+
+1. Grab the prebuilt core from [`releases/`](releases/) (newest
+   `KonamiGV_YYYYMMDD.rbf`).
+2. Prepare the game files — BIOS, EEPROM, flash image, disc ISO — per
+   **[docs/GAME_FILES.md](docs/GAME_FILES.md)**. That page has the exact
+   folder layouts (two supported), the MGL, sha1 hashes of every
+   known-working file, and `tools/make_flash_bin.py` to build the 8 MB
+   flash image in the interleave this core expects.
+3. Launch via the MGL. If you get "FREEPLAY" over a black screen, your
+   flash image is wrong — see the troubleshooting table in GAME_FILES.md.
+
 ## ⚠️ Do NOT use the Service Mode toggle without backing up your EEPROM first
 
 The OSD has a `Service Mode` switch (the cabinet's TEST button). **Before
@@ -37,8 +49,9 @@ and reboot the core. (Holding SERVICE+TEST — the MAME-documented fresh-EEPROM
 init — does not help: that path aborts at the same flash check.)
 
 A proper fix (a 29F016A write path matching MAME's flash emulation, which
-would make the operator/test menu actually reachable) is designed in
-`docs/FLASH_WRITE_DESIGN.md` and in progress.
+makes the operator/test menu reachable) is implemented per
+`docs/FLASH_WRITE_DESIGN.md` and is in final hardware validation — the
+backup-first rule above stands until this note says otherwise.
 
 ## What this board is
 
