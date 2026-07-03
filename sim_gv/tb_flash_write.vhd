@@ -619,6 +619,23 @@ begin
       -- ^ 0x0100 is inside sector 0 which scenario 5 erased -> 0xFFFF expected
 
       ------------------------------------------------------------------
+      -- 7. x8-DATASHEET COMMAND-ADDRESS FORM (intelfsh accepts 0xAAA/0x555/0xAAA;
+      --    the 29F016A is an x8 part - builds #19-#21 only accepted the x16 form)
+      ------------------------------------------------------------------
+      setFA(16#AAA#); wr16(x"1F680080", 16#AAAA#);
+      setFA(16#555#); wr16(x"1F680080", 16#5555#);
+      setFA(16#AAA#); wr16(x"1F680080", 16#9090#);   -- ID via x8-form unlock
+      setFA(0);
+      rd16(x"1F680080", r); chk("x8-form ID maker", r, x"0404");
+      wr16(x"1F680080", 16#F0F0#);
+      setFA(16#AAA#); wr16(x"1F680080", 16#AAAA#);
+      setFA(16#555#); wr16(x"1F680080", 16#5555#);
+      setFA(16#AAA#); wr16(x"1F680080", 16#A0A0#);
+      setFA(16#1020#); wr16(x"1F680080", 16#BEE5#);  -- program via x8 form over 0xFFFF scratch
+      setFA(16#1020#);
+      rd16(x"1F680080", r); chk("x8-form program", r, x"BEE5");
+
+      ------------------------------------------------------------------
       write(l, string'("SUMMARY checks=")); write(l, integer'image(nchk));
       write(l, string'(" fails=")); write(l, integer'image(nfail)); writeline(output, l);
       if nfail = 0 then

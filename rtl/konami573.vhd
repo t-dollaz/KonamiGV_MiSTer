@@ -158,16 +158,20 @@ architecture arch of konami573 is
    function flash_next_mode(m : tFlashMode; a : unsigned(11 downto 0); d : std_logic_vector(7 downto 0)) return tFlashMode is
    begin
       case m is
+         -- u1/u2: intelfsh.cpp accepts BOTH command-address forms - x16 (0x555/
+         -- 0x2AA/0x555) AND the x8 datasheet form (0xAAA/0x555/0xAAA); the 29F016A
+         -- is an x8 part, so game code may use either. Builds #19-#21 only accepted
+         -- the x16 form.
          when FM_NORMAL | FM_AMDID =>
             if    d = x"F0" or d = x"FF"      then return FM_NORMAL;   -- reset chip mode
             elsif d = x"90"                   then return FM_AMDID;    -- read ID
-            elsif d = x"AA" and a = x"555"    then return FM_ID1;      -- unlock 1
+            elsif d = x"AA" and (a = x"555" or a = x"AAA") then return FM_ID1;  -- unlock 1
             else                                   return m;
             end if;
          when FM_ID1 =>
-            if d = x"55" and a = x"2AA" then return FM_ID2; else return FM_NORMAL; end if;
+            if d = x"55" and (a = x"2AA" or a = x"555") then return FM_ID2; else return FM_NORMAL; end if;
          when FM_ID2 =>
-            if a = x"555" then
+            if a = x"555" or a = x"AAA" then
                if    d = x"90" then return FM_AMDID;
                elsif d = x"80" then return FM_ERASE1;
                elsif d = x"A0" then return FM_PROG;
@@ -176,11 +180,11 @@ architecture arch of konami573 is
             else return FM_NORMAL;
             end if;
          when FM_ERASE1 =>
-            if d = x"AA" and a = x"555" then return FM_ERASE2; else return m; end if;
+            if d = x"AA" and (a = x"555" or a = x"AAA") then return FM_ERASE2; else return m; end if;
          when FM_ERASE2 =>
-            if d = x"55" and a = x"2AA" then return FM_ERASE3; else return m; end if;
+            if d = x"55" and (a = x"2AA" or a = x"555") then return FM_ERASE3; else return m; end if;
          when FM_ERASE3 =>
-            if (d = x"10" and a = x"555") or d = x"30" then return FM_ERASING; else return m; end if;
+            if (d = x"10" and (a = x"555" or a = x"AAA")) or d = x"30" then return FM_ERASING; else return m; end if;
          when FM_PROG    => return FM_NORMAL;   -- the data write was consumed (program op enqueued)
          when FM_ERASING => return FM_ERASING;  -- writes ignored while erasing; cleared on op completion
       end case;
@@ -735,20 +739,23 @@ begin
                ring_wr <= ring_wr + 1;
             end if;
 
-            -- write-capture ring: last 8 WRITES to the EEPROM region (serial bit-bang at
-            -- offset 0-3 + window) and the flash window. Never frozen, never evicted by
-            -- input polls - the evidence the 16-deep access ring keeps losing.
-            -- entry = regbit(1: 0=0x18, 1=0x68) & offset(7:0) & data(7:0) & bstep(1)
-            if bus_write = '1' and (region = 16#18# or
-                                    (region = 16#68# and bus_addr(7 downto 4) = "1000")) then
+            -- write-capture ring: EEPROM-region writes and flash DATA-PORT writes ONLY.
+            -- FA address-register writes (0x82-0x87) are 95% of traffic and evicted the
+            -- interesting command bytes within one revolution (build #21: 16 min of
+            -- capture never held an unlock sequence). Data-port entries carry
+            -- FA(11:5) & port-byte-lane in the offset field so the command ADDRESS
+            -- form (0x555 vs 0xAAA -> 0x2A/0x55 in the visible bits) is decodable.
+            -- entry = regbit(1) & offset(7:0) & data(7:0) & bstep(1)
+            if bus_write = '1' then
                if region = 16#18# then
                   wring(to_integer(wring_wr)) <= '0' & std_logic_vector(bus_addr(7 downto 0)) &
                                                  bus_dataWrite & bus_bstep(0);
-               else
-                  wring(to_integer(wring_wr)) <= '1' & std_logic_vector(bus_addr(7 downto 0)) &
+                  wring_wr <= wring_wr + 1;
+               elsif region = 16#68# and bus_addr(7 downto 1) = "1000000" then   -- data port 0x80/0x81
+                  wring(to_integer(wring_wr)) <= '1' & std_logic_vector(FlashAddress(11 downto 5)) & std_logic_vector(bus_addr(0 downto 0)) &
                                                  bus_dataWrite & bus_bstep(0);
+                  wring_wr <= wring_wr + 1;
                end if;
-               wring_wr <= wring_wr + 1;
             end if;
 
             if ms_read10 = '1' and diag_wait /= (diag_wait'range => '1') then
@@ -1053,7 +1060,7 @@ begin
                                  if fl_mode(v_ci) = FM_PROG then
                                     flash_enqueue('0', FlashAddress, to_unsigned(0, 22), bus_dataWrite, '0');
                                  elsif fl_mode(v_ci) = FM_ERASE3 then
-                                    if bus_dataWrite = x"10" and FlashAddress(11 downto 0) = x"555" then
+                                    if bus_dataWrite = x"10" and (FlashAddress(11 downto 0) = x"555" or FlashAddress(11 downto 0) = x"AAA") then
                                        flash_enqueue('1', (FlashAddress and to_unsigned(16#200000#, 24)),         -- chip erase: whole 2MB lane
                                                      to_unsigned(16#200000#, 22), x"FF", '0');
                                     elsif bus_dataWrite = x"30" then
@@ -1083,7 +1090,7 @@ begin
                                  if fl_mode(v_ci) = FM_PROG then
                                     flash_enqueue('0', FlashAddress, to_unsigned(0, 22), bus_dataWrite, '1');
                                  elsif fl_mode(v_ci) = FM_ERASE3 then
-                                    if bus_dataWrite = x"10" and FlashAddress(11 downto 0) = x"555" then
+                                    if bus_dataWrite = x"10" and (FlashAddress(11 downto 0) = x"555" or FlashAddress(11 downto 0) = x"AAA") then
                                        flash_enqueue('1', (FlashAddress and to_unsigned(16#200000#, 24)),
                                                      to_unsigned(16#200000#, 22), x"FF", '1');
                                     elsif bus_dataWrite = x"30" then
